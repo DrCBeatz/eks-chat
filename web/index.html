@@ -235,7 +235,7 @@
       try {
         for await (const evt of ssePost(API.replace(/\/$/, '') + '/chat/stream', body)) {
           if (evt.delta) appendText(aiBubble, evt.delta);
-          if (evt.error) appendText(aiBubble, `\n\n[error] ${evt.error}`);
+          if (evt.error) appendText(aiBubble, `\n\n[error] ${evt.error.message || evt.error}`);
           if (evt.done) break;
         }
       } catch (e) {

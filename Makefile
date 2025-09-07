@@ -1,5 +1,7 @@
 # Makefile
 # ---------- config ----------
+SHELL := /bin/bash
+TAG ?= 0.1
 REGION ?= us-east-1
 CLUSTER ?= eks-chat
 ACCOUNT_ID := $(shell aws sts get-caller-identity --query Account --output text)
@@ -7,6 +9,8 @@ ECR_URI := $(ACCOUNT_ID).dkr.ecr.$(REGION).amazonaws.com
 REPO := llm-chat
 IMAGE := $(ECR_URI)/$(REPO):0.1
 MODEL_ID ?= anthropic.claude-3-haiku-20240307-v1:0
+RAG_BUCKET ?= $(CLUSTER)-rag-$(ACCOUNT_ID)-$(REGION)
+RAG_PREFIX ?= docs/
 
 # ---------- frontend ----------
 FRONTEND_BUCKET ?= $(CLUSTER)-web-$(ACCOUNT_ID)-$(REGION)
@@ -14,12 +18,12 @@ FRONTEND_BUCKET ?= $(CLUSTER)-web-$(ACCOUNT_ID)-$(REGION)
 .PHONY: frontend-up
 frontend-up:
 	@echo "Creating S3 bucket $(FRONTEND_BUCKET) in $(REGION)..."
-ifeq ($(REGION),us-east-1)
-	aws s3api create-bucket --bucket $(FRONTEND_BUCKET) >/dev/null
-else
-	aws s3api create-bucket --bucket $(FRONTEND_BUCKET) \
-	  --create-bucket-configuration LocationConstraint=$(REGION) >/dev/null
-endif
+	@if [ "$(REGION)" = "us-east-1" ]; then \
+	  aws s3api create-bucket --bucket $(FRONTEND_BUCKET) >/dev/null; \
+	else \
+	  aws s3api create-bucket --bucket $(FRONTEND_BUCKET) \
+	    --create-bucket-configuration LocationConstraint=$(REGION) >/dev/null; \
+	fi
 	# Allow public website reads (quick demo approach)
 	aws s3api put-public-access-block --bucket $(FRONTEND_BUCKET) \
 	  --public-access-block-configuration BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false >/dev/null
@@ -48,6 +52,32 @@ frontend-down:
 	-aws s3 rm s3://$(FRONTEND_BUCKET)/ --recursive
 	-aws s3api delete-bucket-policy --bucket $(FRONTEND_BUCKET)
 	-aws s3api delete-bucket --bucket $(FRONTEND_BUCKET)
+
+# ---------- RAG bucket ----------
+.PHONY: rag-bucket
+rag-bucket:
+	aws s3 mb s3://$(RAG_BUCKET) --region $(REGION) || true
+	aws s3 cp data/demo.md s3://$(RAG_BUCKET)/$(RAG_PREFIX)demo.md
+
+.PHONY: rag-iam
+rag-iam:
+	@echo 'Creating S3 read policy for $(RAG_BUCKET)/$(RAG_PREFIX)...'
+	@printf '%s\n' \
+	  '{' \
+	  '  "Version": "2012-10-17",' \
+	  '  "Statement": [' \
+	  '    {"Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::$(RAG_BUCKET)", "Condition": {"StringLike": {"s3:prefix": ["$(RAG_PREFIX)*"]}}},' \
+	  '    {"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::$(RAG_BUCKET)/$(RAG_PREFIX)*"}' \
+	  '  ]' \
+	  '}' > rag-s3-read-policy.json
+	-aws iam create-policy --policy-name rag-s3-read-$(RAG_BUCKET) --policy-document file://rag-s3-read-policy.json >/dev/null
+	# attach both policies to the same SA (override to add)
+	eksctl create iamserviceaccount \
+	  --cluster $(CLUSTER) --region $(REGION) \
+	  --namespace default --name bedrock-sa \
+	  --attach-policy-arn arn:aws:iam::$(ACCOUNT_ID):policy/bedrock-invoke-policy \
+	  --attach-policy-arn arn:aws:iam::$(ACCOUNT_ID):policy/rag-s3-read-$(RAG_BUCKET) \
+	  --override-existing-serviceaccounts --approve
 
 # ---------- cluster ----------
 .PHONY: cluster-up

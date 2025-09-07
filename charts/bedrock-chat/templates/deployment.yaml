@@ -6,35 +6,35 @@ metadata:
   name: {{ include "bedrock-chat.fullname" . | default "bedrock-chat" }}
 spec:
   replicas: {{ .Values.replicaCount }}
-  selector:
-    matchLabels:
-      app: bedrock-chat
+  selector: { matchLabels: { app: bedrock-chat } }
   template:
-    metadata:
-      labels:
-        app: bedrock-chat
+    metadata: { labels: { app: bedrock-chat } }
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
-      nodeSelector:
-        kubernetes.io/arch: arm64
+      nodeSelector: { kubernetes.io/arch: arm64 }
       containers:
         - name: app
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - containerPort: 8000
+          ports: [ { containerPort: 8000 } ]
           env:
-            - name: AWS_REGION
-              value: "{{ .Values.env.AWS_REGION }}"
-            - name: MODEL_ID
-              value: "{{ .Values.env.MODEL_ID }}"
-          readinessProbe:
-            httpGet: { path: /healthz, port: 8000 }
-            initialDelaySeconds: 5
-            periodSeconds: 5
-          livenessProbe:
-            httpGet: { path: /healthz, port: 8000 }
-            initialDelaySeconds: 15
-            periodSeconds: 10
+            - { name: AWS_REGION, value: "{{ .Values.env.AWS_REGION }}" }
+            - { name: MODEL_ID, value: "{{ .Values.env.MODEL_ID }}" }
+            - { name: RAG_S3_BUCKET, value: "{{ .Values.env.RAG_S3_BUCKET }}" }
+            - { name: RAG_S3_PREFIX, value: "{{ .Values.env.RAG_S3_PREFIX }}" }
+            - { name: RAG_ADMIN_TOKEN, valueFrom: { secretKeyRef: { name: bedrock-chat-secrets, key: ragAdminToken } } }
+          volumeMounts:
+          {{- if .Values.persistence.enabled }}
+            - name: store
+              mountPath: /app/store
+          {{- end }}
+          readinessProbe: { httpGet: { path: /healthz, port: 8000 }, initialDelaySeconds: 5, periodSeconds: 5 }
+          livenessProbe:  { httpGet: { path: /healthz, port: 8000 }, initialDelaySeconds: 15, periodSeconds: 10 }
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+      {{- if .Values.persistence.enabled }}
+        - name: store
+          persistentVolumeClaim:
+            claimName: bedrock-chat-store
+      {{- end }}
