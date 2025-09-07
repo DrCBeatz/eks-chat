@@ -1,0 +1,74 @@
+<!-- web/index.html -->
+
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>EKS Chat</title></head>
+<body>
+  <h1>EKS Chat (Bedrock)</h1>
+  <div>
+    <textarea id="prompt" rows="4" cols="60" placeholder="Ask something..."></textarea><br>
+    <button id="send">Send</button>
+  </div>
+  <pre id="out"></pre>
+
+  <!-- 1) Load runtime config (generated per env). Safe if missing. -->
+  <script src="config.js"></script>
+
+  <!-- 2) App script -->
+  <script>
+    // Priority: ?api=... > localStorage > window.API_BASE_URL > localhost defaults
+    function resolveApiBase() {
+      const qs = new URLSearchParams(location.search);
+      const qsApi = qs.get('api');
+      if (qsApi) return qsApi;
+
+      const saved = localStorage.getItem('api_base');
+      if (saved) return saved;
+
+      if (typeof window !== 'undefined' && window.API_BASE_URL && window.API_BASE_URL.trim()) {
+        return window.API_BASE_URL.trim();
+      }
+
+      // Sensible local defaults
+      if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
+        // If you usually run uvicorn locally:
+        return 'http://localhost:8000';
+        // If you usually port-forward a k8s Service:
+        // return 'http://localhost:8080';
+      }
+      return ''; // empty means "not configured"
+    }
+
+    let API = resolveApiBase();
+    if (!API) {
+      document.getElementById('out').textContent =
+        'API base URL is not configured. Set web/config.js or use ?api=http://host:port';
+    }
+
+    // Optional: allow quick override & persist across reloads (open console to use)
+    window.setApiBase = function (url) {
+      localStorage.setItem('api_base', url);
+      API = url;
+      console.log('API base set to:', API);
+    };
+
+    document.getElementById('send').onclick = async () => {
+      const prompt = document.getElementById('prompt').value;
+      if (!API) { alert('No API configured'); return; }
+
+      try {
+        const res = await fetch(API.replace(/\/$/, '') + "/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: [{ role: "user", content: prompt }] })
+        });
+        const data = await res.json();
+        document.getElementById('out').textContent =
+          data.answer ?? JSON.stringify(data, null, 2);
+      } catch (err) {
+        document.getElementById('out').textContent = 'Request failed: ' + err;
+      }
+    };
+  </script>
+</body>
+</html>

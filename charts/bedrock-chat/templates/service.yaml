@@ -1,0 +1,15 @@
+# charts/bedrock-chat/templates/service.yaml
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: bedrock-chat
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: bedrock-chat
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+      name: http

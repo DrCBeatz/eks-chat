@@ -1,0 +1,9 @@
+# requirements.txt
+
+fastapi
+uvicorn[standard]
+boto3
+langchain
+langchain-aws
+langchain-community
+faiss-cpu
