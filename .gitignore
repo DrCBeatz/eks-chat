@@ -1,2 +1,39 @@
+# --- Python / tooling ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+.cache/
+
+# --- OS / IDE ---
 .DS_Store
-.venv
+.idea/
+.vscode/
+
+# --- Env / secrets ---
+.env
+.env.*
+*.env
+
+# --- App artifacts ---
+store/
+
+# Keep example docs; ignore the rest by default
+data/*
+!data/demo.md
+
+# Frontend runtime config (use config.example.js in git)
+web/config.js
+
+# Generated AWS policy files (commit templates instead)
+bedrock-invoke-policy.json
+public-read-policy.json
