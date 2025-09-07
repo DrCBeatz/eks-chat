@@ -1,164 +1,143 @@
 # app/rag.py
-import os
-import json
-import threading
-from datetime import datetime, timezone
+import os, json, time
 from pathlib import Path
-from typing import Iterable, List, Tuple
-
+from typing import List, Optional, Tuple
 import boto3
 from langchain_aws.embeddings import BedrockEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
+from threading import Lock
 
-# ----- Paths & env -----
-BASE_DIR   = Path(os.getenv("APP_BASE_DIR", Path(__file__).resolve().parents[1]))
-STORE_DIR  = Path(os.getenv("STORE_DIR", str(BASE_DIR / "store")))
-DATA_DIR   = Path(os.getenv("DATA_DIR",  str(BASE_DIR / "data")))
+# Paths
+BASE_DIR = Path(os.getenv("APP_BASE_DIR", Path(__file__).resolve().parents[1]))
+STORE_DIR = Path(os.getenv("STORE_DIR", str(BASE_DIR / "store")))
+DATA_DIR  = Path(os.getenv("DATA_DIR",  str(BASE_DIR / "data")))
+META_PATH = STORE_DIR / "meta.json"
 
-# S3 source (optional)
-RAG_S3_BUCKET = os.getenv("RAG_S3_BUCKET", "").strip()
-RAG_S3_PREFIX = os.getenv("RAG_S3_PREFIX", "").strip()
-
-# Tuning
-ALLOWED_SUFFIXES = [s.strip().lower() for s in os.getenv("RAG_SUFFIXES", ".md,.txt,.mdx").split(",") if s.strip()]
-MAX_OBJECT_MB    = float(os.getenv("RAG_MAX_OBJECT_MB", "5"))
-CHUNK_SIZE       = int(os.getenv("RAG_CHUNK_SIZE", "800"))
-CHUNK_OVERLAP    = int(os.getenv("RAG_CHUNK_OVERLAP", "100"))
+# Optional S3 config via env
+RAG_S3_BUCKET = os.getenv("RAG_S3_BUCKET")
+RAG_S3_PREFIX = os.getenv("RAG_S3_PREFIX", "docs/")
 
 STORE_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-_meta_file = STORE_DIR / "meta.json"
-_lock = threading.Lock()
-_cached_retriever = None   # type: ignore
-_cached_vs = None          # type: ignore
+_lock = Lock()
+_cached_retriever = None
+_cached_region = None
 
-def _write_meta(meta: dict):
-    _meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+def _save_meta(meta: dict) -> None:
+    META_PATH.write_text(json.dumps(meta, indent=2))
 
-def _read_meta() -> dict:
-    if _meta_file.exists():
-        try:
-            return json.loads(_meta_file.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
+def _load_meta() -> dict:
+    if META_PATH.exists():
+        return json.loads(META_PATH.read_text())
     return {}
 
-def _split_docs(docs: List[Document]) -> List[Document]:
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    return splitter.split_documents(docs)
-
-def _iter_local_docs() -> List[Document]:
+def _split_docs(texts: List[Tuple[str, str]]) -> List[Document]:
+    """texts: list of (content, source) -> list[Document]."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     docs: List[Document] = []
-    for p in DATA_DIR.glob("*"):
-        if not p.is_file():
-            continue
-        if not any(str(p).lower().endswith(suf) for suf in ALLOWED_SUFFIXES):
-            continue
-        try:
-            txt = p.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-        docs.append(Document(page_content=txt, metadata={"source": p.name}))
+    for content, source in texts:
+        for chunk in splitter.split_text(content):
+            docs.append(Document(page_content=chunk, metadata={"source": source}))
     return docs
 
-def _iter_s3_docs(region: str, bucket: str, prefix: str) -> List[Document]:
+def _embed_and_save(docs: List[Document], region: str) -> FAISS:
+    emb = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0", region_name=region)
+    vs = FAISS.from_documents(docs, emb)
+    vs.save_local(str(STORE_DIR))
+    return vs
+
+def build_index_from_local(region: str) -> Optional[FAISS]:
+    texts: List[Tuple[str, str]] = []
+    for p in DATA_DIR.glob("*.md"):
+        try:
+            content = p.read_text(encoding="utf-8", errors="ignore")
+            texts.append((content, p.name))
+        except Exception:
+            continue
+    if not texts:
+        return None
+    docs = _split_docs(texts)
+    vs = _embed_and_save(docs, region)
+    _save_meta({
+        "source": "local",
+        "files": len(texts),
+        "chunks": len(docs),
+        "time": int(time.time())
+    })
+    return vs
+
+def build_index_from_s3(region: str, bucket: str, prefix: str) -> Optional[FAISS]:
     s3 = boto3.client("s3", region_name=region)
     paginator = s3.get_paginator("list_objects_v2")
-    docs: List[Document] = []
+    texts: List[Tuple[str, str]] = []
+    file_count = 0
+
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
             key = obj["Key"]
-            size_mb = obj["Size"] / (1024 * 1024)
-            if size_mb > MAX_OBJECT_MB:
+            low = key.lower()
+            if not (low.endswith(".md") or low.endswith(".txt")):
                 continue
-            if not any(key.lower().endswith(suf) for suf in ALLOWED_SUFFIXES):
-                continue
-            try:
-                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8", "ignore")
-            except Exception:
-                continue
-            docs.append(Document(page_content=body, metadata={"source": f"s3://{bucket}/{key}", "bytes": obj["Size"]}))
-    return docs
+            body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8", "ignore")
+            texts.append((body, f"s3://{bucket}/{key}"))
+            file_count += 1
 
-def _save_faiss(vs: FAISS):
-    vs.save_local(str(STORE_DIR))
+    if not texts:
+        return None
 
-def _load_faiss(emb: BedrockEmbeddings) -> FAISS:
-    return FAISS.load_local(str(STORE_DIR), emb, allow_dangerous_deserialization=True)
-
-def _build_vs_from_docs(region: str, docs_raw: List[Document]) -> Tuple[FAISS, dict]:
-    if not docs_raw:
-        raise RuntimeError("No documents to index")
-    docs = _split_docs(docs_raw)
-    emb = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0", region_name=region)
-    vs = FAISS.from_documents(docs, emb)
-    meta = {
-        "built_at": datetime.now(timezone.utc).isoformat(),
-        "docs_raw": len(docs_raw),
+    docs = _split_docs(texts)
+    vs = _embed_and_save(docs, region)
+    _save_meta({
+        "source": "s3",
+        "bucket": bucket,
+        "prefix": prefix,
+        "files": file_count,
         "chunks": len(docs),
-        "source": "s3" if RAG_S3_BUCKET else "local",
-        "bucket": RAG_S3_BUCKET or None,
-        "prefix": RAG_S3_PREFIX or None,
-        "model": "amazon.titan-embed-text-v2:0",
-    }
-    _save_faiss(vs)
-    _write_meta(meta)
-    return vs, meta
+        "time": int(time.time())
+    })
+    return vs
 
-def build_index_local(region: str) -> dict:
-    docs_raw = _iter_local_docs()
-    vs, meta = _build_vs_from_docs(region, docs_raw)
-    return meta
+def _load_or_build(region: str) -> Optional[FAISS]:
+    # Prefer existing index on disk
+    if (STORE_DIR / "index.faiss").exists():
+        emb = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0", region_name=region)
+        return FAISS.load_local(str(STORE_DIR), emb, allow_dangerous_deserialization=True)
 
-def build_index_s3(region: str) -> dict:
-    if not RAG_S3_BUCKET:
-        raise RuntimeError("RAG_S3_BUCKET is not set")
-    docs_raw = _iter_s3_docs(region, RAG_S3_BUCKET, RAG_S3_PREFIX)
-    vs, meta = _build_vs_from_docs(region, docs_raw)
-    return meta
+    # Else try S3 if configured
+    if RAG_S3_BUCKET:
+        return build_index_from_s3(region, RAG_S3_BUCKET, RAG_S3_PREFIX)
 
-def status() -> dict:
-    meta = _read_meta()
-    exists = (STORE_DIR / "index.faiss").exists()
-    meta["exists"] = exists
-    return meta
+    # Else fallback to local ./data
+    return build_index_from_local(region)
 
 def get_retriever(region: str):
-    """Return a cached retriever; load FAISS if present, else build from configured source."""
-    global _cached_retriever, _cached_vs
+    global _cached_retriever, _cached_region
     with _lock:
-        if _cached_retriever is not None:
+        if _cached_retriever is not None and _cached_region == region:
             return _cached_retriever
-        emb = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0", region_name=region)
-        if (STORE_DIR / "index.faiss").exists():
-            _cached_vs = _load_faiss(emb)
-        else:
-            # Build from S3 if configured, else from /data
-            if RAG_S3_BUCKET:
-                build_index_s3(region)
-            else:
-                build_index_local(region)
-            _cached_vs = _load_faiss(emb)
-        _cached_retriever = _cached_vs.as_retriever(search_kwargs={"k": 3})
+        index = _load_or_build(region)
+        if index is None:
+            raise RuntimeError("No RAG index available (no local data and/or empty S3 prefix).")
+        _cached_retriever = index.as_retriever(search_kwargs={"k": 3})
+        _cached_region = region
         return _cached_retriever
 
-def reindex(region: str) -> dict:
-    """Force rebuild from configured source and refresh cache."""
-    global _cached_retriever, _cached_vs
+def rebuild_from_s3(region: str, bucket: str, prefix: str):
+    global _cached_retriever, _cached_region
     with _lock:
-        if RAG_S3_BUCKET:
-            meta = build_index_s3(region)
-        else:
-            meta = build_index_local(region)
-        emb = BedrockEmbeddings(model_id="amazon.titan-embed-text-v2:0", region_name=region)
-        _cached_vs = _load_faiss(emb)
-        _cached_retriever = _cached_vs.as_retriever(search_kwargs={"k": 3})
-        return meta
+        vs = build_index_from_s3(region, bucket, prefix)
+        if vs is None:
+            raise RuntimeError("No documents found in S3 for the given bucket/prefix.")
+        _cached_retriever = vs.as_retriever(search_kwargs={"k": 3})
+        _cached_region = region
+        return _cached_retriever
 
-def debug_search(region: str, query: str, k: int = 3) -> List[dict]:
-    ret = get_retriever(region)
-    docs = ret.get_relevant_documents(query)[:k]
-    return [{"content": d.page_content, "meta": d.metadata} for d in docs]
+def get_status() -> dict:
+    meta = _load_meta()
+    has_index = (STORE_DIR / "index.faiss").exists()
+    meta["has_index"] = bool(has_index)
+    meta["store_dir"] = str(STORE_DIR)
+    return meta

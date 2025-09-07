@@ -1,18 +1,21 @@
 # app/main.py
 import os, json
 from typing import List, Optional, Generator
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from botocore.exceptions import ClientError
 
+# ----------- Config -----------
 USE_LANGCHAIN = os.getenv("USE_LANGCHAIN", "true").lower() == "true"
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ID   = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
-# RAG admin token (shared secret)
-RAG_ADMIN_TOKEN = os.getenv("RAG_ADMIN_TOKEN", "").strip()
+# RAG config
+RAG_S3_BUCKET = os.getenv("RAG_S3_BUCKET")             # e.g. eks-chat-rag-...-us-east-1
+RAG_S3_PREFIX = os.getenv("RAG_S3_PREFIX", "docs/")    # e.g. "docs/"
+RAG_TOKEN     = os.getenv("RAG_TOKEN", "").strip()     # shared secret for /rag/reindex (optional; if empty, open)
 
 app = FastAPI(title="Bedrock Chatbot")
 app.add_middleware(
@@ -23,7 +26,7 @@ app.add_middleware(
 
 # ----------- Models -----------
 class ChatTurn(BaseModel):
-    role: str
+    role: str   # "user" | "assistant" | "system"
     content: str
 
 class ChatRequest(BaseModel):
@@ -35,8 +38,9 @@ class ChatRequest(BaseModel):
     k: Optional[int] = 3
 
 class ChatStreamRequest(ChatRequest):
-    system: Optional[str] = None
+    system: Optional[str] = None  # additional system prompt
 
+# ----------- Helpers -----------
 def _require_valid_turns(turns: List["ChatTurn"]):
     if not turns:
         raise HTTPException(status_code=400, detail={"error": "BadRequest", "message": "messages[] is required"})
@@ -50,15 +54,13 @@ def _err_dict(exc: Exception):
         return {"error": e.get("Code", "ClientError"), "message": e.get("Message", str(exc))}
     return {"error": exc.__class__.__name__, "message": str(exc)}
 
-# ----------- Health -----------
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
-# ----------- Optional RAG -----------
 def maybe_rag(query: str, k: int = 3) -> Optional[str]:
     try:
-        from rag import get_retriever
+        from app.rag import get_retriever
         retriever = get_retriever(AWS_REGION)
         docs = retriever.get_relevant_documents(query)[:k]
         if not docs:
@@ -86,7 +88,9 @@ if USE_LANGCHAIN:
             user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
             context = maybe_rag(user_last, req.k or 3)
             if context:
-                lc_msgs.insert(0, SystemMessage("Use the following context to answer. If not helpful, answer normally.\n\n" + context))
+                lc_msgs.insert(0, SystemMessage(
+                    "Use the following context to answer. If not helpful, answer normally.\n\n" + context
+                ))
         try:
             out = llm.invoke(lc_msgs)
             return {"answer": out.content}
@@ -127,7 +131,7 @@ def _to_bedrock_messages(turns: List[ChatTurn]):
     for t in turns:
         if t.role not in ("user","assistant","system"):
             continue
-        if t.role == "system":  # move to system param
+        if t.role == "system":  # moved separately
             continue
         out.append({"role": t.role, "content": [{"text": t.content}]})
     return out
@@ -198,34 +202,37 @@ def chat_stream(req: ChatStreamRequest):
     headers = {"Cache-Control": "no-cache","X-Accel-Buffering": "no","Connection": "keep-alive"}
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
-# ----------- RAG admin/debug -----------
-def _require_admin(request: Request):
-    if not RAG_ADMIN_TOKEN:
-        raise HTTPException(status_code=501, detail={"error": "NotConfigured", "message": "RAG_ADMIN_TOKEN not set on server"})
-    token = request.headers.get("x-admin-token") or (request.headers.get("authorization") or "").replace("Bearer ","").strip()
-    if token != RAG_ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail={"error": "Forbidden", "message": "invalid admin token"})
-
+# ----------- RAG admin -----------
 @app.get("/rag/status")
 def rag_status():
-    from rag import status
-    return status()
+    try:
+        from app.rag import get_status
+        return {"ok": True, "status": get_status()}
+    except Exception as e:
+        return {"ok": False, "error": _err_dict(e)}
 
 @app.post("/rag/reindex")
-def rag_reindex(request: Request):
-    _require_admin(request)
-    from rag import reindex
-    try:
-        meta = reindex(AWS_REGION)
-        return {"ok": True, "meta": meta}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=_err_dict(e))
+def rag_reindex(
+    bucket: Optional[str] = None,
+    prefix: Optional[str] = None,
+    x_rag_token: Optional[str] = Header(default=None, alias="X-RAG-Token"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+):
+    # If RAG_TOKEN is set, require it via X-RAG-Token or Authorization: Bearer <token>
+    if RAG_TOKEN:
+        supplied = (x_rag_token or "") or ((authorization or "").replace("Bearer ", "").strip())
+        if supplied != RAG_TOKEN:
+            raise HTTPException(status_code=403, detail={"error": "Forbidden", "message": "invalid RAG token"})
 
-@app.get("/rag/search")
-def rag_search(q: str, k: int = 3):
-    from rag import debug_search
+    b = bucket or RAG_S3_BUCKET
+    p = prefix or RAG_S3_PREFIX
+    if not b:
+        raise HTTPException(status_code=400, detail={"error": "BadRequest", "message": "RAG_S3_BUCKET not configured"})
+
     try:
-        return {"results": debug_search(AWS_REGION, q, k)}
+        from app.rag import rebuild_from_s3, get_status
+        rebuild_from_s3(AWS_REGION, b, p)
+        return {"ok": True, "bucket": b, "prefix": p, "status": get_status()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=_err_dict(e))
 

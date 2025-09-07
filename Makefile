@@ -11,6 +11,7 @@ IMAGE := $(ECR_URI)/$(REPO):0.1
 MODEL_ID ?= anthropic.claude-3-haiku-20240307-v1:0
 RAG_BUCKET ?= $(CLUSTER)-rag-$(ACCOUNT_ID)-$(REGION)
 RAG_PREFIX ?= docs/
+RAG_TOKEN ?= demo-rag-token
 
 # ---------- frontend ----------
 FRONTEND_BUCKET ?= $(CLUSTER)-web-$(ACCOUNT_ID)-$(REGION)
@@ -123,10 +124,13 @@ build-push:
 deploy:
 	helm upgrade --install bedrock-chat charts/bedrock-chat \
 	  --set image.repository="$(ECR_URI)/$(REPO)" \
-	  --set image.tag="$(TAG)" \
+	--set image.tag="$(TAG)" \
 	  --set image.pullPolicy="Always" \
 	  --set env.AWS_REGION="$(REGION)" \
 	  --set env.MODEL_ID="$(MODEL_ID)" \
+	  --set env.RAG_S3_BUCKET="$(RAG_BUCKET)" \
+	  --set env.RAG_S3_PREFIX="$(RAG_PREFIX)" \
+	  --set env.RAG_TOKEN="$(RAG_TOKEN)" \
 	  --set service.type="LoadBalancer"
 	kubectl rollout status deploy/bedrock-chat
 

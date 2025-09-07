@@ -16,8 +16,8 @@ env:
   AWS_REGION: "us-east-1"
   MODEL_ID: "anthropic.claude-3-haiku-20240307-v1:0"
   RAG_S3_BUCKET: ""
-  RAG_S3_PREFIX: ""
-  RAG_ADMIN_TOKEN: ""
+  RAG_S3_PREFIX: "docs/"
+  RAG_TOKEN: ""
 
 persistence:
   enabled: true
