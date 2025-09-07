@@ -1,3 +1,4 @@
+# Makefile
 # ---------- config ----------
 REGION ?= us-east-1
 CLUSTER ?= eks-chat
@@ -6,6 +7,47 @@ ECR_URI := $(ACCOUNT_ID).dkr.ecr.$(REGION).amazonaws.com
 REPO := llm-chat
 IMAGE := $(ECR_URI)/$(REPO):0.1
 MODEL_ID ?= anthropic.claude-3-haiku-20240307-v1:0
+
+# ---------- frontend ----------
+FRONTEND_BUCKET ?= $(CLUSTER)-web-$(ACCOUNT_ID)-$(REGION)
+
+.PHONY: frontend-up
+frontend-up:
+	@echo "Creating S3 bucket $(FRONTEND_BUCKET) in $(REGION)..."
+ifeq ($(REGION),us-east-1)
+	aws s3api create-bucket --bucket $(FRONTEND_BUCKET) >/dev/null
+else
+	aws s3api create-bucket --bucket $(FRONTEND_BUCKET) \
+	  --create-bucket-configuration LocationConstraint=$(REGION) >/dev/null
+endif
+	# Allow public website reads (quick demo approach)
+	aws s3api put-public-access-block --bucket $(FRONTEND_BUCKET) \
+	  --public-access-block-configuration BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false >/dev/null
+	@echo "Applying public read policy..."
+	@POLICY=$$(jq -n --arg b "$(FRONTEND_BUCKET)" '{Version:"2012-10-17",Statement:[{Sid:"PublicReadGetObject",Effect:"Allow",Principal:"*",Action:["s3:GetObject"],Resource:["arn:aws:s3:::"+$$b+"/*"]}]}'); \
+	aws s3api put-bucket-policy --bucket $(FRONTEND_BUCKET) --policy "$$POLICY"
+	# Enable website hosting
+	aws s3 website s3://$(FRONTEND_BUCKET)/ --index-document index.html --error-document index.html
+
+.PHONY: frontend-deploy
+frontend-deploy:
+	@echo "Syncing ./web to s3://$(FRONTEND_BUCKET)/ ..."
+	aws s3 sync web/ s3://$(FRONTEND_BUCKET)/ --delete --cache-control max-age=60
+	@$(MAKE) frontend-url
+
+.PHONY: frontend-url
+frontend-url:
+ifeq ($(REGION),us-east-1)
+	@echo "http://$(FRONTEND_BUCKET).s3-website-us-east-1.amazonaws.com"
+else
+	@echo "http://$(FRONTEND_BUCKET).s3-website-$(REGION).amazonaws.com"
+endif
+
+.PHONY: frontend-down
+frontend-down:
+	-aws s3 rm s3://$(FRONTEND_BUCKET)/ --recursive
+	-aws s3api delete-bucket-policy --bucket $(FRONTEND_BUCKET)
+	-aws s3api delete-bucket --bucket $(FRONTEND_BUCKET)
 
 # ---------- cluster ----------
 .PHONY: cluster-up
@@ -43,15 +85,16 @@ cluster-down:
 build-push:
 	-aws ecr create-repository --repository-name $(REPO) --region $(REGION) >/dev/null
 	aws ecr get-login-password --region $(REGION) | docker login --username AWS --password-stdin $(ECR_URI)
-	docker buildx build --platform linux/arm64 -t $(IMAGE) .
-	docker push $(IMAGE)
+	docker buildx build --platform linux/arm64 -t $(ECR_URI)/$(REPO):$(TAG) .
+	docker push $(ECR_URI)/$(REPO):$(TAG)
 
 # ---------- deploy ----------
 .PHONY: deploy
 deploy:
 	helm upgrade --install bedrock-chat charts/bedrock-chat \
 	  --set image.repository="$(ECR_URI)/$(REPO)" \
-	  --set image.tag="0.1" \
+	  --set image.tag="$(TAG)" \
+	  --set image.pullPolicy="Always" \
 	  --set env.AWS_REGION="$(REGION)" \
 	  --set env.MODEL_ID="$(MODEL_ID)" \
 	  --set service.type="LoadBalancer"

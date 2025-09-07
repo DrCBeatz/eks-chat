@@ -1,74 +1,254 @@
-<!-- web/index.html -->
-
 <!doctype html>
-<html>
-<head><meta charset="utf-8"><title>EKS Chat</title></head>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>EKS Chat (Bedrock)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0f172a;           /* slate-900 */
+      --panel: #111827;        /* gray-900 */
+      --muted: #94a3b8;        /* slate-400 */
+      --text: #e5e7eb;         /* gray-200 */
+      --accent: #22d3ee;       /* cyan-400 */
+      --accent-2: #38bdf8;     /* sky-400 */
+      --danger: #f87171;       /* red-400 */
+      --bubble-user: #1e293b;  /* slate-800 */
+      --bubble-ai: #0b1324;    /* deep indigo */
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; background: var(--bg); color: var(--text); margin: 0; font: 16px/1.5 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji"; }
+    a { color: var(--accent); text-decoration: none; }
+    .app { max-width: 900px; margin: 0 auto; padding: 16px; display: flex; flex-direction: column; height: 100%; gap: 12px; }
+    header { display:flex; align-items:center; gap:12px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    header h1 { font-size: 18px; margin: 0; letter-spacing: 0.25px; }
+    .chip { padding: 2px 8px; border-radius: 999px; background: #0b1220; color: var(--muted); border: 1px solid rgba(255,255,255,0.08); font-size: 12px; }
+
+    #chat { flex: 1; overflow: auto; padding: 8px 0 4px; display: flex; flex-direction: column; gap: 10px; }
+    .msg { display: flex; gap: 10px; align-items: flex-start; }
+    .msg .bubble {
+      max-width: 80%;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.06);
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    .msg.user { justify-content: flex-end; }
+    .msg.user .bubble { background: var(--bubble-user); }
+    .msg.assistant .bubble { background: var(--bubble-ai); }
+
+    .meta { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .toolbar { display:flex; align-items:center; gap:12px; flex-wrap: wrap; color: var(--muted); }
+    .toolbar label { display:flex; align-items:center; gap:8px; }
+    .toolbar input[type="range"] { width: 160px; }
+    details.settings summary { cursor: pointer; color: var(--muted); margin: 4px 0; }
+    details.settings textarea { width: 100%; min-height: 80px; background: var(--panel); color: var(--text); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 8px; }
+
+    .composer { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+    textarea#prompt {
+      width: 100%; min-height: 76px; max-height: 260px; resize: vertical;
+      background: var(--panel); color: var(--text); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 10px 12px;
+    }
+    button#send {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      color: #0b1220; border: none; padding: 10px 14px; border-radius: 10px; font-weight: 700; cursor: pointer;
+    }
+    button#send:disabled { opacity: 0.5; cursor: not-allowed; }
+    .typing { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: pulse 1.2s infinite ease-in-out; }
+    .dot:nth-child(2) { animation-delay: .15s }
+    .dot:nth-child(3) { animation-delay: .3s }
+    @keyframes pulse { 0%, 80%, 100% { opacity: .2 } 40% { opacity: 1 } }
+
+    .error { color: var(--danger); }
+    .foot { font-size: 12px; color: var(--muted); text-align: center; padding: 4px 0 8px; }
+  </style>
+</head>
 <body>
-  <h1>EKS Chat (Bedrock)</h1>
-  <div>
-    <textarea id="prompt" rows="4" cols="60" placeholder="Ask something..."></textarea><br>
-    <button id="send">Send</button>
+  <div class="app">
+    <header>
+      <h1>EKS Chat</h1>
+      <span class="chip">Bedrock · Claude 3 Haiku</span>
+      <span id="apiChip" class="chip"></span>
+    </header>
+
+    <div id="chat"></div>
+
+    <div class="toolbar">
+      <label>Temperature
+        <input id="temperature" type="range" min="0" max="1" step="0.1">
+        <span id="tempVal">0.4</span>
+      </label>
+      <label><input id="rag" type="checkbox"> RAG</label>
+      <a href="#" id="editApi">set API</a>
+    </div>
+
+    <details class="settings">
+      <summary>System prompt (optional)</summary>
+      <textarea id="systemPrompt" placeholder="You are a helpful assistant."></textarea>
+    </details>
+
+    <div class="composer">
+      <textarea id="prompt" placeholder="Ask something… (Shift+Enter = newline, Enter = send)"></textarea>
+      <button id="send">Send</button>
+    </div>
+
+    <div class="foot">Tip: press <strong>Enter</strong> to send, <strong>Shift+Enter</strong> for newline.</div>
   </div>
-  <pre id="out"></pre>
 
-  <!-- 1) Load runtime config (generated per env). Safe if missing. -->
+  <!-- runtime config (optional) -->
   <script src="config.js"></script>
-
-  <!-- 2) App script -->
   <script>
-    // Priority: ?api=... > localStorage > window.API_BASE_URL > localhost defaults
+    // --------- API base discovery ---------
     function resolveApiBase() {
       const qs = new URLSearchParams(location.search);
-      const qsApi = qs.get('api');
-      if (qsApi) return qsApi;
-
+      const q = qs.get('api');
+      if (q) return q;
       const saved = localStorage.getItem('api_base');
       if (saved) return saved;
-
       if (typeof window !== 'undefined' && window.API_BASE_URL && window.API_BASE_URL.trim()) {
         return window.API_BASE_URL.trim();
       }
-
-      // Sensible local defaults
       if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-        // If you usually run uvicorn locally:
         return 'http://localhost:8000';
-        // If you usually port-forward a k8s Service:
-        // return 'http://localhost:8080';
       }
-      return ''; // empty means "not configured"
+      return '';
     }
-
     let API = resolveApiBase();
-    if (!API) {
-      document.getElementById('out').textContent =
-        'API base URL is not configured. Set web/config.js or use ?api=http://host:port';
-    }
+    const apiChip = document.getElementById('apiChip');
+    apiChip.textContent = API ? new URL(API).host : 'API not set';
 
-    // Optional: allow quick override & persist across reloads (open console to use)
-    window.setApiBase = function (url) {
-      localStorage.setItem('api_base', url);
-      API = url;
-      console.log('API base set to:', API);
+    document.getElementById('editApi').onclick = (e) => {
+      e.preventDefault();
+      const val = prompt('Backend API base URL', API || 'http://localhost:8000');
+      if (val) {
+        API = val.replace(/\/$/, '');
+        localStorage.setItem('api_base', API);
+        apiChip.textContent = new URL(API).host;
+      }
     };
 
-    document.getElementById('send').onclick = async () => {
-      const prompt = document.getElementById('prompt').value;
-      if (!API) { alert('No API configured'); return; }
+    // --------- Settings (persist) ---------
+    const tempEl = document.getElementById('temperature');
+    const tempValEl = document.getElementById('tempVal');
+    const ragEl = document.getElementById('rag');
+    const sysEl = document.getElementById('systemPrompt');
+
+    function loadSettings() {
+      const t = +(localStorage.getItem('temperature') ?? 0.4);
+      tempEl.value = t; tempValEl.textContent = t.toFixed(1);
+      ragEl.checked = localStorage.getItem('rag') === 'true';
+      sysEl.value = localStorage.getItem('system') || '';
+    }
+    loadSettings();
+
+    tempEl.oninput = () => { tempValEl.textContent = (+tempEl.value).toFixed(1); };
+    tempEl.onchange = () => { localStorage.setItem('temperature', tempEl.value); };
+    ragEl.onchange = () => { localStorage.setItem('rag', ragEl.checked ? 'true' : 'false'); };
+    sysEl.onchange = () => { localStorage.setItem('system', sysEl.value); };
+
+    // --------- Chat UI helpers ---------
+    const chat = document.getElementById('chat');
+    function addMessage(role, text, typing=false) {
+      const wrap = document.createElement('div');
+      wrap.className = `msg ${role}`;
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text || '';
+      wrap.appendChild(bubble);
+
+      if (typing) {
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.innerHTML = `<span class="typing"><span class="dot"></span><span class="dot"></span><span class="dot"></span> thinking…</span>`;
+        bubble.appendChild(document.createElement('div')).appendChild(meta);
+      }
+
+      chat.appendChild(wrap);
+      chat.scrollTop = chat.scrollHeight;
+      return bubble; // so we can append to it
+    }
+
+    function appendText(bubble, txt) {
+      bubble.firstChild ? bubble.firstChild.textContent += txt : (bubble.textContent += txt);
+      chat.scrollTop = chat.scrollHeight;
+    }
+
+    // --------- Streaming fetch (SSE over POST) ---------
+    async function* ssePost(url, body) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) >= 0) {
+          const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+          const line = frame.split('\n').find(l => l.startsWith('data:'));
+          if (!line) continue;
+          const json = line.slice(5).trim();
+          if (!json) continue;
+          let evt;
+          try { evt = JSON.parse(json); } catch { continue; }
+          yield evt;
+        }
+      }
+    }
+
+    // --------- Send handler ---------
+    const promptEl = document.getElementById('prompt');
+    const sendBtn = document.getElementById('send');
+
+    async function send() {
+      const prompt = promptEl.value.trim();
+      if (!API) { alert('API not configured'); return; }
+      if (!prompt) return;
+
+      // push user message
+      addMessage('user', prompt);
+      promptEl.value = '';
+      sendBtn.disabled = true;
+
+      // create assistant bubble with typing indicator
+      const aiBubble = addMessage('assistant', '', true);
+
+      const messages = [{ role: 'user', content: prompt }];
+      const body = {
+        messages,
+        temperature: +tempEl.value,
+        top_p: 0.9,
+        max_tokens: 512,
+        rag: ragEl.checked,
+        system: sysEl.value || undefined,
+      };
 
       try {
-        const res = await fetch(API.replace(/\/$/, '') + "/chat", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: [{ role: "user", content: prompt }] })
-        });
-        const data = await res.json();
-        document.getElementById('out').textContent =
-          data.answer ?? JSON.stringify(data, null, 2);
-      } catch (err) {
-        document.getElementById('out').textContent = 'Request failed: ' + err;
+        for await (const evt of ssePost(API.replace(/\/$/, '') + '/chat/stream', body)) {
+          if (evt.delta) appendText(aiBubble, evt.delta);
+          if (evt.error) appendText(aiBubble, `\n\n[error] ${evt.error}`);
+          if (evt.done) break;
+        }
+      } catch (e) {
+        appendText(aiBubble, `\n\n[request failed] ${e}`);
+      } finally {
+        sendBtn.disabled = false;
       }
-    };
+    }
+
+    sendBtn.onclick = send;
+    promptEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    });
   </script>
 </body>
 </html>
