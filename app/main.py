@@ -1,11 +1,13 @@
 # app/main.py
 import os, json, re
-from typing import List, Optional, Generator
+from typing import List, Optional, Generator, Tuple
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from botocore.exceptions import ClientError
+import boto3
 
 # ----------- Config -----------
 USE_LANGCHAIN = os.getenv("USE_LANGCHAIN", "true").lower() == "true"
@@ -13,9 +15,9 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ID   = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
 # RAG config
-RAG_S3_BUCKET = os.getenv("RAG_S3_BUCKET")
-RAG_S3_PREFIX = os.getenv("RAG_S3_PREFIX", "docs/")
-RAG_TOKEN     = os.getenv("RAG_TOKEN", "").strip()
+RAG_S3_BUCKET = os.getenv("RAG_S3_BUCKET")            # e.g. eks-chat-rag-...-us-east-1
+RAG_S3_PREFIX = os.getenv("RAG_S3_PREFIX", "docs/")   # e.g. "docs/"
+RAG_TOKEN     = os.getenv("RAG_TOKEN", "").strip()    # shared secret for /rag/reindex
 
 app = FastAPI(title="Bedrock Chatbot")
 app.add_middleware(
@@ -41,51 +43,24 @@ class ChatRequest(BaseModel):
 class ChatStreamRequest(ChatRequest):
     system: Optional[str] = None  # additional system prompt
 
-STRICT_TMPL = """You are a medical policy assistant.
+# ----------- Prompts -----------
+STRICT_TMPL = (
+    "Use ONLY the following policy context to answer. "
+    "If it does not directly address the question, reply exactly: Not in policy.\n\n"
+    "<CONTEXT>\n{context}\n</CONTEXT>\n"
+)
 
-<CONTEXT>
-{context}
-</CONTEXT>
-
-RULES (STRICT):
-1) Use ONLY facts from CONTEXT. Do not use outside knowledge.
-2) If the answer is not directly present, reply exactly: Not in policy.
-3) After each sentence, include bracketed citation(s) to the supporting chunk IDs, e.g. [1] or [1][2].
-4) Be concise and policy‑style.
-"""
-
-NONSTRICT_TMPL = """Use the following context if helpful. If not helpful, answer normally.
-
-<CONTEXT>
-{context}
-</CONTEXT>
-"""
+NONSTRICT_TMPL = (
+    "Use the following context if helpful. If not helpful, answer normally.\n\n"
+    "<CONTEXT>\n{context}\n</CONTEXT>\n"
+)
 
 def _format_context_blocks(docs: List["Document"]) -> str:
     return "\n\n".join([f"[{i+1}] {d.page_content}" for i, d in enumerate(docs)])
 
-def _retrieve_with_sources(query: str, k: int, strict: bool):
-    # Lazy import to avoid hard dependency on startup
-    from app.rag import get_retriever
-    ret = get_retriever(AWS_REGION)
-    docs = ret.get_relevant_documents(query)[: (k or 3)]
-    sources = [{
-        "source": d.metadata.get("source", "?"),
-        "section": d.metadata.get("section"),
-        "preview": d.page_content[:240],
-    } for d in docs]
-
-    if strict:
-        # very simple lexical overlap gate to avoid OOD answers
-        kws = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", query)}
-        overlap = any(any(kw in d.page_content.lower() for kw in kws) for d in docs)
-        if not overlap:
-            return [], sources
-    return docs, sources
-
-# ----------- Helpers -----------
+# ----------- Retrieval helpers -----------
 def _expand_query_for_med(q: str) -> str:
-    """Light synonym expansion to improve recall."""
+    """Light synonym expansion to improve recall for common policy terms."""
     ql = q.lower()
     extra = []
     if "pa" in ql or "prior auth" in ql or "authorization" in ql:
@@ -100,6 +75,86 @@ def _expand_query_for_med(q: str) -> str:
         return q
     return q + " " + " ".join(sorted(set(extra)))
 
+_STOP = {
+    "the","a","an","and","or","of","to","for","in","on","with","by","at","from",
+    "is","are","be","as","that","this","it","its","about","please","list","show"
+}
+
+def _normalize_tokens(s: str):
+    return [w for w in re.findall(r"[a-z0-9]+", s.lower()) if w not in _STOP and len(w) > 2]
+
+def _keyword_overlap_score(question: str, texts: list[str]) -> float:
+    """Tiny lexical safety net if the judge fails/parses poorly."""
+    q = set(_normalize_tokens(question))
+    if not q: return 0.0
+    t = set()
+    for x in texts: t.update(_normalize_tokens(x))
+    return len(q & t) / max(1, len(q))
+
+def _build_sources(docs) -> list[dict]:
+    out = []
+    for d in docs or []:
+        out.append({
+            "source": d.metadata.get("source", "unknown"),
+            "section": d.metadata.get("section") or d.metadata.get("title") or d.metadata.get("heading") or "Document",
+            "preview": (d.page_content or "")[:240]
+        })
+    return out
+
+def _collect_docs_and_context(region: str, question: str, k: int = 6) -> Tuple[list, str]:
+    """Get top-k docs and build a single context string with light section headers."""
+    try:
+        from app.rag import get_retriever
+        ret = get_retriever(region)
+        docs = ret.get_relevant_documents(_expand_query_for_med(question))[:k]
+    except Exception:
+        docs = []
+    if not docs:
+        return [], ""
+    parts = []
+    for i, d in enumerate(docs, 1):
+        sec = d.metadata.get("section") or d.metadata.get("title") or d.metadata.get("heading") or d.metadata.get("source") or f"Section {i}"
+        parts.append(f"[{sec}]\n{d.page_content.strip()}")
+    return docs, "\n\n".join(parts)
+
+# ----------- Judge (JSON-only) -----------
+def _judge_supported(question: str, context_blocks: str) -> bool:
+    """
+    Returns True if the question can be answered *directly* from the provided context
+    (based on a small JSON decision by the model). If anything fails, bias to True.
+    """
+    if not context_blocks.strip():
+        return False
+
+    judge_system = (
+        "You are a strict policy support judge.\n"
+        "Decide if the USER QUESTION can be answered *directly and explicitly* from the CONTEXT excerpts.\n"
+        "Only consider information present in the CONTEXT; ignore general world knowledge.\n"
+        "Reply with strictly valid JSON: {\"supported\": true|false, \"why\": \"<short reason>\"}.\n"
+        "Examples:\n"
+        "USER: \"List covered CGM codes.\" CONTEXT contains explicit list of codes -> {\"supported\": true, \"why\": \"codes listed\"}\n"
+        "USER: \"What is the capital of France?\" CONTEXT about CGM policy -> {\"supported\": false, \"why\": \"topic not in policy\"}\n"
+    )
+    user_text = f"USER QUESTION:\n{question}\n\nCONTEXT EXCERPTS:\n{context_blocks}"
+
+    try:
+        # Use a fresh Bedrock client here to decouple from streaming client init order.
+        bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+        resp = bedrock.converse(
+            modelId=MODEL_ID,
+            messages=[{"role": "user", "content": [{"text": user_text}]}],
+            system=[{"text": judge_system}],
+            inferenceConfig={"maxTokens": 128, "temperature": 0.0, "topP": 0.9},
+            # If the model supports it, you can add: responseFormat={"type": "json"}
+        )
+        txt = "".join([p.get("text","") for p in resp["output"]["message"]["content"]]).strip()
+        data = json.loads(txt)
+        return bool(data.get("supported") is True)
+    except Exception:
+        # If we can't parse JSON or call judge, err on the side of answering (less false negatives)
+        return True
+
+# ----------- Common helpers -----------
 def _require_valid_turns(turns: List["ChatTurn"]):
     if not turns:
         raise HTTPException(status_code=400, detail={"error": "BadRequest", "message": "messages[] is required"})
@@ -128,22 +183,7 @@ def maybe_rag(query: str, k: int = 3) -> Optional[str]:
     except Exception:
         return None
 
-# ----------- RAG helper -----------
-
-def _retrieve_context(query: str, k: int) -> tuple[str, list]:
-    """Return (joined_context_text, docs[]) using section-aware retriever."""
-    try:
-        from app.rag import get_retriever
-        q = _expand_query_for_med(query)
-        ret = get_retriever(AWS_REGION)
-        docs = ret.get_relevant_documents(q)[: (k or 3)]
-        ctx = "\n\n".join(d.page_content for d in docs) if docs else ""
-        return ctx, docs
-    except Exception:
-        return "", []
-    
-# ----------- Non-streaming paths -----------
-
+# ----------- Non-streaming /chat -----------
 if USE_LANGCHAIN:
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
     from langchain_aws import ChatBedrockConverse
@@ -152,72 +192,75 @@ if USE_LANGCHAIN:
     @app.post("/chat")
     def chat(req: ChatRequest):
         _require_valid_turns(req.messages)
-
         user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
-        docs, sources = ([], [])
-        sys_text = None
 
+        sources: list[dict] = []
+        context_text = ""
         if req.rag and user_last:
-            docs, sources = _retrieve_with_sources(user_last, req.k or 3, req.strict)
-            if req.strict and not docs:
-                return {"answer": "Not in policy.", "sources": sources}
+            docs, context_text = _collect_docs_and_context(AWS_REGION, user_last, k=req.k or 6)
+            sources = _build_sources(docs)
+            if req.strict and not _judge_supported(user_last, context_text):
+                # Tiny lexical backstop in case judge is too harsh/failed
+                if _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
+                    return {"answer": "Not in policy.", "sources": sources}
 
-            if docs:
-                context = _format_context_blocks(docs)
-                sys_text = STRICT_TMPL.format(context=context) if req.strict else NONSTRICT_TMPL.format(context=context)
+        lc_msgs = []
+        if context_text:
+            sys_text = STRICT_TMPL.format(context=context_text) if req.strict else NONSTRICT_TMPL.format(context=context_text)
+            lc_msgs.append(SystemMessage(sys_text))
+        for m in req.messages:
+            if m.role == "user": lc_msgs.append(HumanMessage(m.content))
+            elif m.role == "assistant": lc_msgs.append(AIMessage(m.content))
+            elif m.role == "system": lc_msgs.append(SystemMessage(m.content))
 
-        if USE_LANGCHAIN:
-            from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-            from langchain_aws import ChatBedrockConverse
+        try:
+            out = llm.invoke(lc_msgs)
+            ans = out.content or ""
+            return {"answer": ans, "sources": sources if req.rag else None}
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=_err_dict(e))
 
-            llm = ChatBedrockConverse(model=MODEL_ID, region_name=AWS_REGION)
+else:
+    # Optional: non-LangChain boto3 path with the same strict/judge logic
+    @app.post("/chat")
+    def chat(req: ChatRequest):
+        _require_valid_turns(req.messages)
+        user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
 
-            lc_msgs = []
-            if sys_text:
-                lc_msgs.append(SystemMessage(sys_text))
-            for m in req.messages:
-                if m.role == "user": lc_msgs.append(HumanMessage(m.content))
-                elif m.role == "assistant": lc_msgs.append(AIMessage(m.content))
-                elif m.role == "system": lc_msgs.append(SystemMessage(m.content))
+        bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+        sources: list[dict] = []
+        context_text = ""
+        if req.rag and user_last:
+            docs, context_text = _collect_docs_and_context(AWS_REGION, user_last, k=req.k or 6)
+            sources = _build_sources(docs)
+            if req.strict and not _judge_supported(user_last, context_text):
+                if _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
+                    return {"answer": "Not in policy.", "sources": sources}
 
-            try:
-                out = llm.invoke(lc_msgs)
-                ans = out.content or ""
-                # optional post-check: must include a citation if strict
-                if req.strict and docs and "[" not in ans:
-                    ans = "Not in policy."
-                return {"answer": ans, "sources": sources}
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=_err_dict(e))
-        else:
-            import boto3
-            bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+        messages = []
+        if context_text:
+            sys_text = STRICT_TMPL.format(context=context_text) if req.strict else NONSTRICT_TMPL.format(context=context_text)
+            messages.append({"role": "system", "content": [{"text": sys_text}]})
+        # Send only the latest user question to reduce drift
+        messages.append({"role": "user", "content": [{"text": user_last or ''}]})
 
-            # Collapse history for simplicity
-            text = "\n".join([f"{m.role.upper()}: {m.content}" for m in req.messages])
-            messages = []
-            if sys_text:
-                messages.append({"role": "system", "content": [{"text": sys_text}]})
-            messages.append({"role": "user", "content": [{"text": text}]})
-
-            try:
-                inference = {
+        try:
+            resp = bedrock.converse(
+                modelId=MODEL_ID,
+                messages=messages,
+                inferenceConfig={
                     "maxTokens": req.max_tokens,
                     "temperature": 0.0 if req.strict else req.temperature,
                     "topP": 0.1 if req.strict else req.top_p,
-                }
-                resp = bedrock.converse(modelId=MODEL_ID, messages=messages, inferenceConfig=inference)
-                parts = resp["output"]["message"]["content"]
-                ans = "".join([p.get("text","") for p in parts])
-                if req.strict and (not docs or "[" not in ans):
-                    ans = "Not in policy."
-                return {"answer": ans, "sources": sources}
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=_err_dict(e))
-        
-# ----------- Streaming (boto3) -----------
+                },
+            )
+            parts = resp["output"]["message"]["content"]
+            ans = "".join([p.get("text","") for p in parts])
+            return {"answer": ans, "sources": sources if req.rag else None}
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=_err_dict(e))
 
-import boto3
+# ----------- Streaming (boto3) -----------
 _bedrock_stream = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
 def _to_bedrock_messages(turns: List[ChatTurn]):
@@ -244,34 +287,25 @@ def _sse(obj) -> bytes:
 def chat_stream(req: ChatStreamRequest):
     _require_valid_turns(req.messages)
     user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
-    docs, sources = ([], [])
-    sys_text = None
+    sources: list[dict] = []
+    context_text = ""
 
     if req.rag and user_last:
-        docs, sources = _retrieve_with_sources(user_last, req.k or 3, req.strict)
-        # send sources immediately so UI can render "Sources"
-        if sources:
-            yield_first = True
-        else:
-            yield_first = False
-        # early bail if strict and nothing relevant
-        if req.strict and not docs:
-            def gen_bail():
-                if yield_first:
-                    yield _sse({"sources": sources})
-                yield _sse({"delta": "Not in policy."})
-                yield _sse({"done": True})
-            return StreamingResponse(gen_bail(), media_type="text/event-stream", headers={
-                "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive",
-            })
-        if docs:
-            context = _format_context_blocks(docs)
-            sys_text = STRICT_TMPL.format(context=context) if req.strict else NONSTRICT_TMPL.format(context=context)
+        docs, context_text = _collect_docs_and_context(AWS_REGION, user_last, k=req.k or 6)
+        sources = _build_sources(docs)
 
     def gen() -> Generator[bytes, None, None]:
         try:
             if sources:
                 yield _sse({"sources": sources})
+
+            # STRICT gate: short-circuit when context doesn't directly support
+            if req.rag and req.strict:
+                if not _judge_supported(user_last, context_text):
+                    if _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
+                        yield _sse({"delta": "Not in policy."})
+                        yield _sse({"done": True})
+                        return
 
             kwargs = {
                 "modelId": MODEL_ID,
@@ -282,11 +316,13 @@ def chat_stream(req: ChatStreamRequest):
                     "topP": 0.1 if req.strict else req.top_p,
                 },
             }
-            if sys_text:
+            # Add system with context if any
+            if context_text:
+                sys_text = STRICT_TMPL.format(context=context_text) if req.strict else NONSTRICT_TMPL.format(context=context_text)
                 kwargs["system"] = [{"text": sys_text}]
-            # collapse history
-            text = "\n".join([f"{m.role.upper()}: {m.content}" for m in req.messages])
-            kwargs["messages"].append({"role": "user", "content": [{"text": text}]})
+
+            # Send only the latest user question
+            kwargs["messages"].append({"role": "user", "content": [{"text": user_last}]})
 
             resp = _bedrock_stream.converse_stream(**kwargs)
             stream = resp.get("stream")
@@ -353,7 +389,7 @@ def rag_reindex(
 @app.get("/rag/search")
 def rag_search(q: str, k: int = 3):
     try:
-        from rag import search as rag_search_impl
+        from app.rag import search as rag_search_impl
         return {"results": rag_search_impl(AWS_REGION, q, k)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=_err_dict(e))
