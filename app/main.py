@@ -236,6 +236,14 @@ def rag_reindex(
     except Exception as e:
         raise HTTPException(status_code=500, detail=_err_dict(e))
 
+@app.get("/rag/search")
+def rag_search(q: str, k: int = 3):
+    try:
+        from rag import search as rag_search_impl
+        return {"results": rag_search_impl(AWS_REGION, q, k)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=_err_dict(e))
+
 @app.get("/")
 def root():
     return {"ok": True, "model": MODEL_ID, "region": AWS_REGION}

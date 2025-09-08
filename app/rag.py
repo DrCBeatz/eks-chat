@@ -141,3 +141,15 @@ def get_status() -> dict:
     meta["has_index"] = bool(has_index)
     meta["store_dir"] = str(STORE_DIR)
     return meta
+
+def search(region: str, query: str, k: int = 3):
+    """Return top-k documents (no scores) for debugging."""
+    ret = get_retriever(region)
+    docs = ret.get_relevant_documents(query)[:k]
+    out = []
+    for d in docs:
+        out.append({
+            "source": d.metadata.get("source"),
+            "text": d.page_content[:400],
+        })
+    return out

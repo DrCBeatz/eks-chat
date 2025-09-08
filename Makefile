@@ -80,6 +80,14 @@ rag-iam:
 	  --attach-policy-arn arn:aws:iam::$(ACCOUNT_ID):policy/rag-s3-read-$(RAG_BUCKET) \
 	  --override-existing-serviceaccounts --approve
 
+.PHONY: rag-bind
+rag-bind:
+	@ROLE_ARN=$$(kubectl get sa bedrock-sa -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}'); \
+	ROLE_NAME=$${ROLE_ARN##*/}; \
+	echo "Attaching policy to $$ROLE_NAME"; \
+	aws iam attach-role-policy --role-name $$ROLE_NAME \
+	  --policy-arn arn:aws:iam::$(ACCOUNT_ID):policy/rag-s3-read-$(RAG_BUCKET)
+	  
 # ---------- cluster ----------
 .PHONY: cluster-up
 cluster-up:
