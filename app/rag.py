@@ -36,7 +36,7 @@ def _load_meta() -> dict:
 
 def _split_docs(texts: List[Tuple[str, str]]) -> List[Document]:
     """texts: list of (content, source) -> list[Document]."""
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=60)
     docs: List[Document] = []
     for content, source in texts:
         for chunk in splitter.split_text(content):

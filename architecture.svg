@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg width="1040" height="640" viewBox="0 0 1040 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .box { fill:#0f172a; stroke:#4b5563; stroke-width:1.2; rx:10; }
+      .title { fill:#e5e7eb; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; font-size:14px; font-weight:700; }
+      .text { fill:#cbd5e1; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; font-size:13px; }
+      .line { stroke:#64748b; stroke-width:1.5; marker-end:url(#arrow); }
+      .groupTitle { fill:#93c5fd; font-weight:700; font-size:12px; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L10,4 L0,8 z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="1040" height="640" fill="#0b1220"/>
+  <text x="24" y="36" class="title" font-size="20">EKS Chat (Bedrock) — System Architecture</text>
+
+  <!-- Frontend (S3 website) -->
+  <rect x="32" y="80" width="280" height="100" class="box"/>
+  <text x="48" y="108" class="title">Browser (S3 Static Website)</text>
+  <text x="48" y="132" class="text">• Web UI (index.html, config.js)</text>
+  <text x="48" y="152" class="text">• Calls API over HTTPS</text>
+
+  <!-- ALB -->
+  <rect x="360" y="95" width="160" height="70" class="box"/>
+  <text x="376" y="122" class="title">AWS ALB</text>
+  <text x="376" y="142" class="text">HTTP → Service</text>
+
+  <!-- Backend (FastAPI) -->
+  <rect x="560" y="80" width="280" height="130" class="box"/>
+  <text x="576" y="108" class="title">FastAPI Pod (EKS)</text>
+  <text x="576" y="132" class="text">• /chat (Converse)</text>
+  <text x="576" y="152" class="text">• /chat/stream (SSE)</text>
+  <text x="576" y="172" class="text">• /rag/reindex, /rag/status</text>
+
+  <!-- Bedrock Claude -->
+  <rect x="560" y="260" width="280" height="100" class="box"/>
+  <text x="576" y="288" class="title">Amazon Bedrock — Claude 3 Haiku</text>
+  <text x="576" y="310" class="text">• Converse / Stream</text>
+
+  <!-- Titan Embeddings -->
+  <rect x="560" y="400" width="280" height="100" class="box"/>
+  <text x="576" y="428" class="title">Amazon Bedrock — Titan Embeddings v2</text>
+  <text x="576" y="450" class="text">• Text embedding for RAG</text>
+
+  <!-- FAISS index -->
+  <rect x="876" y="80" width="132" height="130" class="box"/>
+  <text x="888" y="108" class="title">FAISS Index</text>
+  <text x="888" y="132" class="text">/app/store</text>
+  <text x="888" y="152" class="text">PVC (optional)</text>
+
+  <!-- S3 docs -->
+  <rect x="876" y="260" width="132" height="100" class="box"/>
+  <text x="888" y="288" class="title">Amazon S3</text>
+  <text x="888" y="310" class="text">docs/ (md, txt)</text>
+
+  <!-- Lines -->
+  <line x1="312" y1="130" x2="360" y2="130" class="line"/>
+  <line x1="520" y1="130" x2="560" y2="130" class="line"/>
+  <line x1="700" y1="210" x2="700" y2="260" class="line"/>
+  <line x1="700" y1="360" x2="700" y2="400" class="line"/>
+  <line x1="840" y1="130" x2="876" y2="130" class="line"/>
+  <line x1="840" y1="310" x2="876" y2="310" class="line"/>
+  <line x1="700" y1="180" x2="700" y2="130" class="line"/>
+
+  <!-- Group labels -->
+  <text x="562" y="70" class="groupTitle">EKS Namespace</text>
+  <text x="878" y="70" class="groupTitle">Storage</text>
+
+  <!-- Footer -->
+  <text x="24" y="612" class="text">Demo only. Not medical advice. Bedrock model access required in region.</text>
+</svg>
