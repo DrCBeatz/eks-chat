@@ -1,3 +1,4 @@
+<!-- web/index.html -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -70,6 +71,7 @@
     <header>
       <h1>EKS Chat</h1>
       <span class="chip">Bedrock · Claude 3 Haiku</span>
+      <span id="strictChip" class="chip" style="display:none">STRICT</span> <!-- NEW -->
       <span id="apiChip" class="chip"></span>
     </header>
 
@@ -81,6 +83,7 @@
         <span id="tempVal">0.4</span>
       </label>
       <label><input id="rag" type="checkbox"> RAG</label>
+      <label title="Answer only from policy context"><input id="strict" type="checkbox"> Strict</label> <!-- NEW -->
       <a href="#" id="editApi">set API</a>
     </div>
 
@@ -100,6 +103,7 @@
   <!-- runtime config (optional) -->
   <script src="config.js"></script>
   <script>
+    
     // --------- API base discovery ---------
     function resolveApiBase() {
       const qs = new URLSearchParams(location.search);
@@ -133,19 +137,37 @@
     const tempEl = document.getElementById('temperature');
     const tempValEl = document.getElementById('tempVal');
     const ragEl = document.getElementById('rag');
+    const strictEl = document.getElementById('strict');
+    const strictChip = document.getElementById('strictChip');
     const sysEl = document.getElementById('systemPrompt');
+    strictEl.disabled = !ragEl.checked;
 
     function loadSettings() {
       const t = +(localStorage.getItem('temperature') ?? 0.4);
       tempEl.value = t; tempValEl.textContent = t.toFixed(1);
       ragEl.checked = localStorage.getItem('rag') === 'true';
-      sysEl.value = localStorage.getItem('system') || '';
+      strictEl.checked = localStorage.getItem('strict') === 'true';
+      strictEl.disabled = !ragEl.checked;
+      strictChip.style.display = strictEl.checked ? 'inline-block' : 'none';
     }
     loadSettings();
 
+
     tempEl.oninput = () => { tempValEl.textContent = (+tempEl.value).toFixed(1); };
     tempEl.onchange = () => { localStorage.setItem('temperature', tempEl.value); };
-    ragEl.onchange = () => { localStorage.setItem('rag', ragEl.checked ? 'true' : 'false'); };
+    ragEl.onchange = () => {
+      localStorage.setItem('rag', ragEl.checked ? 'true' : 'false');
+      strictEl.disabled = !ragEl.checked;
+      if (!ragEl.checked && strictEl.checked) {
+        strictEl.checked = false;
+        localStorage.setItem('strict', 'false');
+        strictChip.style.display = 'none';
+      }
+    };
+    strictEl.onchange = () => {
+      localStorage.setItem('strict', strictEl.checked ? 'true' : 'false');
+      strictChip.style.display = strictEl.checked ? 'inline-block' : 'none';
+    };
     sysEl.onchange = () => { localStorage.setItem('system', sysEl.value); };
 
     // --------- Chat UI helpers ---------
@@ -209,6 +231,17 @@
     const promptEl = document.getElementById('prompt');
     const sendBtn = document.getElementById('send');
 
+    function renderSources(bubble, sources) {
+      const box = document.createElement('div');
+      box.className = 'meta';
+      box.style.marginTop = '6px';
+      const items = sources.map(s =>
+        `<div>• <span title="${(s.preview||'').replace(/"/g,'&quot;')}"><code>${s.section || 'Document'}</code> — ${s.source}</span></div>`
+      ).join('');
+      box.innerHTML = `<div><strong>Sources</strong></div>${items}`;
+      bubble.appendChild(box);
+    }
+
     async function send() {
       const prompt = promptEl.value.trim();
       if (!API) { alert('API not configured'); return; }
@@ -223,19 +256,24 @@
       const aiBubble = addMessage('assistant', '', true);
 
       const messages = [{ role: 'user', content: prompt }];
+
+      const effTemp = strictEl.checked ? Math.min(+tempEl.value, 0.2) : +tempEl.value;
+
       const body = {
-        messages,
-        temperature: +tempEl.value,
-        top_p: 0.9,
-        max_tokens: 512,
-        rag: ragEl.checked,
-        system: sysEl.value || undefined,
-      };
+      messages,
+      temperature: effTemp,
+      top_p: 0.9,
+      max_tokens: 512,
+      rag: ragEl.checked,
+      strict: strictEl.checked,
+      system: sysEl.value || undefined,
+    };
 
       try {
         for await (const evt of ssePost(API.replace(/\/$/, '') + '/chat/stream', body)) {
+          if (evt.sources) renderSources(aiBubble, evt.sources);
           if (evt.delta) appendText(aiBubble, evt.delta);
-          if (evt.error) appendText(aiBubble, `\n\n[error] ${evt.error.message || evt.error}`);
+          if (evt.error) appendText(aiBubble, `\n\n[error] ${JSON.stringify(evt.error)}`);
           if (evt.done) break;
         }
       } catch (e) {

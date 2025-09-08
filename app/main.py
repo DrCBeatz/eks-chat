@@ -1,5 +1,5 @@
 # app/main.py
-import os, json
+import os, json, re
 from typing import List, Optional, Generator
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,9 +13,9 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 MODEL_ID   = os.getenv("MODEL_ID", "anthropic.claude-3-haiku-20240307-v1:0")
 
 # RAG config
-RAG_S3_BUCKET = os.getenv("RAG_S3_BUCKET")             # e.g. eks-chat-rag-...-us-east-1
-RAG_S3_PREFIX = os.getenv("RAG_S3_PREFIX", "docs/")    # e.g. "docs/"
-RAG_TOKEN     = os.getenv("RAG_TOKEN", "").strip()     # shared secret for /rag/reindex (optional; if empty, open)
+RAG_S3_BUCKET = os.getenv("RAG_S3_BUCKET")
+RAG_S3_PREFIX = os.getenv("RAG_S3_PREFIX", "docs/")
+RAG_TOKEN     = os.getenv("RAG_TOKEN", "").strip()
 
 app = FastAPI(title="Bedrock Chatbot")
 app.add_middleware(
@@ -36,11 +36,70 @@ class ChatRequest(BaseModel):
     max_tokens: Optional[int] = 512
     rag: Optional[bool] = False
     k: Optional[int] = 3
+    strict: Optional[bool] = False
 
 class ChatStreamRequest(ChatRequest):
     system: Optional[str] = None  # additional system prompt
 
+STRICT_TMPL = """You are a medical policy assistant.
+
+<CONTEXT>
+{context}
+</CONTEXT>
+
+RULES (STRICT):
+1) Use ONLY facts from CONTEXT. Do not use outside knowledge.
+2) If the answer is not directly present, reply exactly: Not in policy.
+3) After each sentence, include bracketed citation(s) to the supporting chunk IDs, e.g. [1] or [1][2].
+4) Be concise and policy‑style.
+"""
+
+NONSTRICT_TMPL = """Use the following context if helpful. If not helpful, answer normally.
+
+<CONTEXT>
+{context}
+</CONTEXT>
+"""
+
+def _format_context_blocks(docs: List["Document"]) -> str:
+    return "\n\n".join([f"[{i+1}] {d.page_content}" for i, d in enumerate(docs)])
+
+def _retrieve_with_sources(query: str, k: int, strict: bool):
+    # Lazy import to avoid hard dependency on startup
+    from app.rag import get_retriever
+    ret = get_retriever(AWS_REGION)
+    docs = ret.get_relevant_documents(query)[: (k or 3)]
+    sources = [{
+        "source": d.metadata.get("source", "?"),
+        "section": d.metadata.get("section"),
+        "preview": d.page_content[:240],
+    } for d in docs]
+
+    if strict:
+        # very simple lexical overlap gate to avoid OOD answers
+        kws = {w.lower() for w in re.findall(r"[A-Za-z]{4,}", query)}
+        overlap = any(any(kw in d.page_content.lower() for kw in kws) for d in docs)
+        if not overlap:
+            return [], sources
+    return docs, sources
+
 # ----------- Helpers -----------
+def _expand_query_for_med(q: str) -> str:
+    """Light synonym expansion to improve recall."""
+    ql = q.lower()
+    extra = []
+    if "pa" in ql or "prior auth" in ql or "authorization" in ql:
+        extra += ["prior authorization", "preauthorization", "re-authorization", "renewal"]
+    if "cgm" in ql:
+        extra += ["continuous glucose monitor", "continuous glucose monitoring"]
+    if "appeal" in ql or "griev" in ql:
+        extra += ["appeals", "grievance"]
+    if "glp" in ql or "weight" in ql or "semag" in ql:
+        extra += ["GLP-1", "weight management", "semaglutide", "liraglutide"]
+    if not extra:
+        return q
+    return q + " " + " ".join(sorted(set(extra)))
+
 def _require_valid_turns(turns: List["ChatTurn"]):
     if not turns:
         raise HTTPException(status_code=400, detail={"error": "BadRequest", "message": "messages[] is required"})
@@ -69,7 +128,22 @@ def maybe_rag(query: str, k: int = 3) -> Optional[str]:
     except Exception:
         return None
 
-# ----------- Non-streaming -----------
+# ----------- RAG helper -----------
+
+def _retrieve_context(query: str, k: int) -> tuple[str, list]:
+    """Return (joined_context_text, docs[]) using section-aware retriever."""
+    try:
+        from app.rag import get_retriever
+        q = _expand_query_for_med(query)
+        ret = get_retriever(AWS_REGION)
+        docs = ret.get_relevant_documents(q)[: (k or 3)]
+        ctx = "\n\n".join(d.page_content for d in docs) if docs else ""
+        return ctx, docs
+    except Exception:
+        return "", []
+    
+# ----------- Non-streaming paths -----------
+
 if USE_LANGCHAIN:
     from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
     from langchain_aws import ChatBedrockConverse
@@ -78,51 +152,71 @@ if USE_LANGCHAIN:
     @app.post("/chat")
     def chat(req: ChatRequest):
         _require_valid_turns(req.messages)
-        lc_msgs = []
-        for m in req.messages:
-            if m.role == "user": lc_msgs.append(HumanMessage(m.content))
-            elif m.role == "assistant": lc_msgs.append(AIMessage(m.content))
-            elif m.role == "system": lc_msgs.append(SystemMessage(m.content))
 
-        if req.rag:
-            user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
-            context = maybe_rag(user_last, req.k or 3)
-            if context:
-                lc_msgs.insert(0, SystemMessage(
-                    "Use the following context to answer. If not helpful, answer normally.\n\n" + context
-                ))
-        try:
-            out = llm.invoke(lc_msgs)
-            return {"answer": out.content}
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=_err_dict(e))
-else:
-    import boto3
-    bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+        user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
+        docs, sources = ([], [])
+        sys_text = None
 
-    @app.post("/chat")
-    def chat(req: ChatRequest):
-        _require_valid_turns(req.messages)
-        text = "\n".join([f"{m.role.upper()}: {m.content}" for m in req.messages])
+        if req.rag and user_last:
+            docs, sources = _retrieve_with_sources(user_last, req.k or 3, req.strict)
+            if req.strict and not docs:
+                return {"answer": "Not in policy.", "sources": sources}
 
-        if req.rag:
-            user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
-            context = maybe_rag(user_last, req.k or 3)
-            if context:
-                text = f"CONTEXT:\n{context}\n\nCHAT:\n{text}"
-        try:
-            resp = bedrock.converse(
-                modelId=MODEL_ID,
-                messages=[{"role":"user","content":[{"text": text}]}],
-                inferenceConfig={"maxTokens": req.max_tokens, "temperature": req.temperature, "topP": req.top_p},
-            )
-            parts = resp["output"]["message"]["content"]
-            answer = "".join([p.get("text","") for p in parts])
-            return {"answer": answer}
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=_err_dict(e))
+            if docs:
+                context = _format_context_blocks(docs)
+                sys_text = STRICT_TMPL.format(context=context) if req.strict else NONSTRICT_TMPL.format(context=context)
 
+        if USE_LANGCHAIN:
+            from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+            from langchain_aws import ChatBedrockConverse
+
+            llm = ChatBedrockConverse(model=MODEL_ID, region_name=AWS_REGION)
+
+            lc_msgs = []
+            if sys_text:
+                lc_msgs.append(SystemMessage(sys_text))
+            for m in req.messages:
+                if m.role == "user": lc_msgs.append(HumanMessage(m.content))
+                elif m.role == "assistant": lc_msgs.append(AIMessage(m.content))
+                elif m.role == "system": lc_msgs.append(SystemMessage(m.content))
+
+            try:
+                out = llm.invoke(lc_msgs)
+                ans = out.content or ""
+                # optional post-check: must include a citation if strict
+                if req.strict and docs and "[" not in ans:
+                    ans = "Not in policy."
+                return {"answer": ans, "sources": sources}
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=_err_dict(e))
+        else:
+            import boto3
+            bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
+
+            # Collapse history for simplicity
+            text = "\n".join([f"{m.role.upper()}: {m.content}" for m in req.messages])
+            messages = []
+            if sys_text:
+                messages.append({"role": "system", "content": [{"text": sys_text}]})
+            messages.append({"role": "user", "content": [{"text": text}]})
+
+            try:
+                inference = {
+                    "maxTokens": req.max_tokens,
+                    "temperature": 0.0 if req.strict else req.temperature,
+                    "topP": 0.1 if req.strict else req.top_p,
+                }
+                resp = bedrock.converse(modelId=MODEL_ID, messages=messages, inferenceConfig=inference)
+                parts = resp["output"]["message"]["content"]
+                ans = "".join([p.get("text","") for p in parts])
+                if req.strict and (not docs or "[" not in ans):
+                    ans = "Not in policy."
+                return {"answer": ans, "sources": sources}
+            except Exception as e:
+                raise HTTPException(status_code=502, detail=_err_dict(e))
+        
 # ----------- Streaming (boto3) -----------
+
 import boto3
 _bedrock_stream = boto3.client("bedrock-runtime", region_name=AWS_REGION)
 
@@ -131,23 +225,17 @@ def _to_bedrock_messages(turns: List[ChatTurn]):
     for t in turns:
         if t.role not in ("user","assistant","system"):
             continue
-        if t.role == "system":  # moved separately
+        if t.role == "system":
             continue
         out.append({"role": t.role, "content": [{"text": t.content}]})
     return out
 
 def _gather_system(req: ChatStreamRequest) -> Optional[str]:
-    sys_pieces = [t.content for t in req.messages if t.role == "system"]
+    sys_pieces = []
     if req.system:
-        sys_pieces.insert(0, req.system)
-    if req.rag:
-        user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
-        ctx = maybe_rag(user_last, req.k or 3)
-        if ctx:
-            sys_pieces.insert(0, "Use the following context to answer. If not helpful, answer normally.\n\n" + ctx)
-    if not sys_pieces:
-        return None
-    return "\n\n".join(sys_pieces)
+        sys_pieces.append(req.system)
+    sys_pieces += [t.content for t in req.messages if t.role == "system"]
+    return "\n\n".join(sys_pieces) if sys_pieces else None
 
 def _sse(obj) -> bytes:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
@@ -155,22 +243,50 @@ def _sse(obj) -> bytes:
 @app.post("/chat/stream")
 def chat_stream(req: ChatStreamRequest):
     _require_valid_turns(req.messages)
-    messages = _to_bedrock_messages(req.messages)
-    sys_text = _gather_system(req)
+    user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
+    docs, sources = ([], [])
+    sys_text = None
+
+    if req.rag and user_last:
+        docs, sources = _retrieve_with_sources(user_last, req.k or 3, req.strict)
+        # send sources immediately so UI can render "Sources"
+        if sources:
+            yield_first = True
+        else:
+            yield_first = False
+        # early bail if strict and nothing relevant
+        if req.strict and not docs:
+            def gen_bail():
+                if yield_first:
+                    yield _sse({"sources": sources})
+                yield _sse({"delta": "Not in policy."})
+                yield _sse({"done": True})
+            return StreamingResponse(gen_bail(), media_type="text/event-stream", headers={
+                "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive",
+            })
+        if docs:
+            context = _format_context_blocks(docs)
+            sys_text = STRICT_TMPL.format(context=context) if req.strict else NONSTRICT_TMPL.format(context=context)
 
     def gen() -> Generator[bytes, None, None]:
         try:
+            if sources:
+                yield _sse({"sources": sources})
+
             kwargs = {
                 "modelId": MODEL_ID,
-                "messages": messages,
+                "messages": [],
                 "inferenceConfig": {
                     "maxTokens": req.max_tokens,
-                    "temperature": req.temperature,
-                    "topP": req.top_p,
+                    "temperature": 0.0 if req.strict else req.temperature,
+                    "topP": 0.1 if req.strict else req.top_p,
                 },
             }
             if sys_text:
-                kwargs["system"] = [{"text": sys_text}]  # only include when present
+                kwargs["system"] = [{"text": sys_text}]
+            # collapse history
+            text = "\n".join([f"{m.role.upper()}: {m.content}" for m in req.messages])
+            kwargs["messages"].append({"role": "user", "content": [{"text": text}]})
 
             resp = _bedrock_stream.converse_stream(**kwargs)
             stream = resp.get("stream")
@@ -180,9 +296,9 @@ def chat_stream(req: ChatStreamRequest):
 
             for event in stream:
                 if "contentBlockDelta" in event:
-                    text = event["contentBlockDelta"]["delta"].get("text")
-                    if text:
-                        yield _sse({"delta": text})
+                    t = event["contentBlockDelta"]["delta"].get("text")
+                    if t:
+                        yield _sse({"delta": t})
                 elif "messageStop" in event:
                     usage = event["messageStop"].get("metadata", {}).get("usage")
                     yield _sse({"done": True, "usage": usage})
@@ -194,8 +310,6 @@ def chat_stream(req: ChatStreamRequest):
                     yield _sse({"error": {"type": "ValidationException", "message": "Request validation failed"}}); break
                 elif "modelStreamErrorException" in event:
                     yield _sse({"error": {"type": "ModelStreamErrorException", "message": "Model stream error"}}); break
-
-            yield _sse({"done": True})
         except Exception as e:
             yield _sse(_err_dict(e))
 

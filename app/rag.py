@@ -1,5 +1,5 @@
 # app/rag.py
-import os, json, time
+import os, json, time, re
 from pathlib import Path
 from typing import List, Optional, Tuple
 import boto3
@@ -34,13 +34,37 @@ def _load_meta() -> dict:
         return json.loads(META_PATH.read_text())
     return {}
 
+HEADER_RE = re.compile(r'^(#{1,6})\s+(.*)')
+
+def _split_md_to_sections(text: str) -> List[Tuple[str, str]]:
+    """Return list of (section_title, section_text)."""
+    sections: List[Tuple[str, str]] = []
+    current_title = "Document"
+    buf: List[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = HEADER_RE.match(line)
+        if m:
+            if buf:
+                sections.append((current_title, "\n".join(buf).strip()))
+                buf = []
+            current_title = m.group(2).strip() or "Untitled"
+        else:
+            buf.append(raw)
+    if buf:
+        sections.append((current_title, "\n".join(buf).strip()))
+    return sections
+
 def _split_docs(texts: List[Tuple[str, str]]) -> List[Document]:
-    """texts: list of (content, source) -> list[Document]."""
-    splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=60)
+    """texts: list of (content, source) -> list[Document] with 'section' metadata."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
     docs: List[Document] = []
     for content, source in texts:
-        for chunk in splitter.split_text(content):
-            docs.append(Document(page_content=chunk, metadata={"source": source}))
+        for title, body in _split_md_to_sections(content):
+            if not body.strip():
+                continue
+            for chunk in splitter.split_text(body):
+                docs.append(Document(page_content=chunk, metadata={"source": source, "section": title}))
     return docs
 
 def _embed_and_save(docs: List[Document], region: str) -> FAISS:
@@ -150,6 +174,7 @@ def search(region: str, query: str, k: int = 3):
     for d in docs:
         out.append({
             "source": d.metadata.get("source"),
+            "section": d.metadata.get("section"),
             "text": d.page_content[:400],
         })
     return out
