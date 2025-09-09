@@ -1,33 +1,48 @@
-# EKS Chat (Bedrock) — Streaming + RAG Demo
+# EKS Medical Policy Chat (Bedrock) — Streaming + RAG Demo
 
 A tiny streaming chat app that runs on **AWS EKS**, serves a static **web UI on S3**, calls **Amazon Bedrock** (Claude 3 Haiku), and optionally performs **RAG** using **Titan Embeddings v2** + **FAISS**. It’s designed to be easy to demo and cheap to run.
 
-> **Demo intent only.** Not medical advice. Do not put PHI in the system.
+> **Demo intent only.** Not medical advice. Do not enter PHI.
 
 ---
 
 ## 👩‍⚕️ 2‑Minute Tour (for non‑technical reviewers)
 
 1. **Open** the web app (S3 website URL).
-2. In the header chip, confirm the **API host** (ALB URL of the backend). Click **“set API”** if you need to change it.
+2. In the header, check the chips:
+   - **API** — current backend host (ALB). Click **“set API”** to change.
+   - **KB** — knowledge‑base status (files & chunks from `/rag/status`).
+   - **RAG** — appears when RAG is ON.
+   - **STRICT** — appears when Strict mode is ON.
 3. In the toolbar:
    - **Temperature** — lower = more deterministic; higher = more creative.
-   - **RAG** — when ON, the bot can use the internal **policy knowledge base**.
+   - **RAG** — when ON, answers can cite the internal **policy knowledge base**.
    - **Strict** — when ON, answers must come **only** from the policy context; otherwise the bot replies **“Not in policy.”**
 4. (Optional) Add a **System prompt** to change tone/role.
-5. Ask a question:
-   - **Policy example**: “List covered CGM codes.” → expect a grounded answer + **Sources**.
-   - **Out‑of‑policy example**: “What is the capital of France?”  
-     - **Strict ON** → **Not in policy.**  
-     - **Strict OFF** → “Paris.”
-6. Watch tokens stream in real‑time. If RAG is on, a **Sources** box shows which chunks supported the answer.
+5. Try a few questions (use the sample buttons under the composer):
+   - **In‑policy**: “List covered CGM codes.” → grounded answer + **Sources**.
+   - **Out‑of‑policy**: “What is the capital of France?”  
+     - **RAG ON + Strict ON** → **Not in policy.**  
+     - **RAG ON + Strict OFF** → model may answer from general knowledge (and **won’t** show sources for this query).
+
+> The **Sources** panel appears when the backend has determined the answer was supported by the policy context (always shown in Strict mode, otherwise shown only if supported).
+
+---
+
+## What’s new (since 0.5)
+
+- 🧱 **Strict Mode Guardrail** — JSON “support judge” route gates answers to policy only; strict path short‑circuits to **“Not in policy.”**
+- 🧾 **Citations logic** — in **non‑strict**, sources are shown **only when** the retrieved context supported the answer; in **strict**, sources are always shown.
+- 🧭 **UI chips/badges** — **RAG**, **STRICT**, **API host**, and **KB status** chips.
+- 🎯 **Sample prompt buttons** — one‑click examples for reviewers.
+- ⚠️ **Safety banner** — “Demo only — not medical advice; do not enter PHI.”
 
 ---
 
 ## Features
 
 - ⚡ **Streaming responses (SSE)** — tokens arrive as the model generates them.
-- 🧠 **Retrieval‑Augmented Generation (RAG)** — Titan Embeddings v2 + FAISS; index can be rebuilt from S3.
+- 🧠 **RAG** — Titan Embeddings v2 + FAISS; index can be rebuilt from S3.
 - 🧾 **Sources / Evidence** — the UI shows which chunks supported the answer.
 - 🧱 **Strict Mode** — when enabled, answers must be grounded in retrieved policy context; otherwise the bot replies **“Not in policy.”**
 - 🧩 **System prompt & Temperature** — tweak behavior and creativity (saved in localStorage).
@@ -44,11 +59,11 @@ The diagram below is also included as `architecture.svg` in the repo.
 
 **High‑level:**
 
-- **Frontend**: S3 static website (`web/`) calling the API
-- **Backend**: FastAPI container on EKS (streaming SSE; `/chat` and `/chat/stream`)
-- **Models**: Bedrock (Claude 3 Haiku), Titan Embeddings v2
-- **RAG**: FAISS index persisted under `/app/store` (PVC), able to rebuild from S3
-- **Auth**: `/rag/reindex` requires `X-RAG-Token`
+- **Frontend**: S3 static website (`web/`) calling the API (`/chat`, `/chat/stream`, `/rag/status`).
+- **Backend**: FastAPI container on EKS (SSE streaming) with a **Support Judge** micro‑prompt to enforce strict grounding.
+- **Models**: Bedrock (Claude 3 Haiku) for chat + judge; Titan Embeddings v2 for RAG.
+- **RAG**: FAISS index persisted under `/app/store` (PVC), refreshed from S3 via `/rag/reindex`.
+- **Auth**: `/rag/reindex` requires `X‑RAG‑Token` (shared secret).
 
 ---
 
@@ -96,18 +111,18 @@ make cluster-up           # EKS cluster + OIDC + bedrock invoke policy + SA
 
 **Build & push** the image to ECR:
 ```bash
-TAG=0.5 make build-push   # or TAG=$(git rev-parse --short HEAD)
+TAG=$(git rev-parse --short HEAD) make build-push
 ```
 
 **Create RAG bucket** and seed demo content:
 ```bash
 make rag-bucket           # creates s3://<cluster>-rag-<acct>-<region>/docs/demo.md
-make rag-iam              # creates/attaches S3 read policy to the workload role
+make rag-iam              # attaches S3 read policy to the workload role
 ```
 
 **Deploy the app** (ALB Service + envs):
 ```bash
-RAG_TOKEN='your-strong-token' TAG=0.5 make deploy
+RAG_TOKEN='your-strong-token' make deploy TAG=$(git rev-parse --short HEAD)
 make url   # prints API base URL (ALB hostname)
 ```
 
@@ -123,7 +138,7 @@ echo "window.API_BASE_URL = 'http://<ALB_HOSTNAME>'" > web/config.js
 make frontend-deploy
 make frontend-url   # prints the website URL
 ```
-> **Note:** For production, prefer CloudFront + OAI/WAF instead of a public S3 website.
+> **Production**: prefer CloudFront + OAI/WAF rather than a public S3 website.
 
 ---
 
@@ -146,7 +161,8 @@ make frontend-url   # prints the website URL
    - **RAG ON + Strict ON**  
      - “List covered CGM codes” → policy‑grounded answer + **Sources**
      - “What is the capital of France?” → **Not in policy.**
-   - **RAG OFF** — chat behaves like a general LLM.
+   - **RAG ON + Strict OFF** — model can use general knowledge; sources only appear when the policy context supported the answer.
+   - **RAG OFF** — chat behaves like a general LLM (no Sources).
 
 ---
 
@@ -210,8 +226,8 @@ curl -sS "$API_URL/rag/search?q=glp-1%20renewal&k=3" | jq .
 - **Strict** — answers only if supported by retrieved policy context; else **“Not in policy.”**
 - **Temperature** — lower (e.g., 0.2) = more deterministic; higher = more creative.
 - **System prompt** — optional; sets tone/role (saved locally).
-- **Sources** — shows which chunk/section supported the answer.
-- **API badge** — shows the backend host; click **“set API”** to change.
+- **Sources** — shows which chunk/section supported the answer (always in strict; conditional in non‑strict).
+- **Header chips** — **API**, **KB**, **RAG**, **STRICT** show live state.
 
 ---
 
@@ -258,26 +274,14 @@ make down
   make rag-iam
   kubectl rollout restart deploy/bedrock-chat
   ```
-- **`ModuleNotFoundError: rag`** — Import via the package path in FastAPI:
+- **`/rag/search` NameError** — ensure the import & name match in `main.py`:
   ```python
-  from app.rag import get_retriever, rebuild_from_s3, get_status
-  ```
-- **`404 /rag/search`** — You’re running an older image. Bump the tag, redeploy, and check:
-  ```bash
-  curl -sS "$API_URL/openapi.json" | jq '.paths | keys'
+  from app.rag import search as rag_search_impl  # (fix typo)
   ```
 - **Streaming differs from `/chat`** — `/chat` can use LangChain while `/chat/stream` uses boto3. To unify behavior:
   ```bash
   --set env.USE_LANGCHAIN="false"
   ```
-
----
-
-## Security Notes
-
-- Demo enables CORS and a public ALB. Limit exposure if sharing widely (WAF/IP allowlist, CloudFront).
-- Keep `RAG_TOKEN` strong; prefer a Kubernetes Secret / AWS Secrets Manager in real deployments.
-- Do not ingest PHI; data is stored in your S3 bucket and vector index on the pod PVC.
 
 ---
 
