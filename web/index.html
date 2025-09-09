@@ -3,7 +3,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>EKS Chat (Bedrock)</title>
+  <title>EKS Medical Policy Chat (RAG Demo)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
     :root {
@@ -69,11 +69,17 @@
 <body>
   <div class="app">
     <header>
-      <h1>EKS Chat</h1>
+      <h1>🛡️ EKS Medical Policy Chat</h1>
+      <span class="chip">RAG Demo</span>
       <span class="chip">Bedrock · Claude 3 Haiku</span>
-      <span id="strictChip" class="chip" style="display:none">STRICT</span> <!-- NEW -->
+      <span id="strictChip" class="chip" style="display:none">STRICT</span>
+      <span id="kbChip" class="chip" title="Knowledge base status">KB: …</span>
       <span id="apiChip" class="chip"></span>
     </header>
+
+    <div id="banner" class="chip" style="align-self:flex-start; background:#1b253b;">
+      Demo only — not medical advice · Do not enter PHI
+    </div>
 
     <div id="chat"></div>
 
@@ -97,8 +103,20 @@
       <button id="send">Send</button>
     </div>
 
-    <div class="foot">Tip: press <strong>Enter</strong> to send, <strong>Shift+Enter</strong> for newline.</div>
-  </div>
+    <div id="samples" class="meta" style="margin-top:6px;">
+      Try: 
+      <button class="chip" data-q="List covered CGM codes">List covered CGM codes</button>
+      <button class="chip" data-q="Is prior authorization required for CGM renewal?">
+        Is prior auth required for CGM renewal?
+      </button>
+      <button class="chip" data-q="What A1C or hypoglycemia thresholds are needed for CGM eligibility?">
+        A1C/hypoglycemia thresholds
+      </button>
+    </div>
+
+    <div class="foot">
+      Medical policy RAG demo · Powered by AWS Bedrock & EKS · Not medical advice
+    </div>
 
   <!-- runtime config (optional) -->
   <script src="config.js"></script>
@@ -132,6 +150,34 @@
         apiChip.textContent = new URL(API).host;
       }
     };
+
+    const kbChip = document.getElementById('kbChip');
+    async function refreshKb() {
+      if (!API) { kbChip.textContent = 'KB: n/a'; return; }
+      try {
+        const res = await fetch(API.replace(/\/$/, '') + '/rag/status');
+        const j = await res.json();
+        if (j && j.ok && j.status) {
+          const { files, chunks } = j.status;
+          kbChip.textContent = `KB: ${files ?? '?'} file(s), ${chunks ?? '?'} chunk(s)`;
+        } else {
+          kbChip.textContent = 'KB: n/a';
+        }
+      } catch {
+        kbChip.textContent = 'KB: n/a';
+      }
+    }
+    refreshKb();
+    document.getElementById('samples')?.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-q]');
+      if (!btn) return;
+      const q = btn.getAttribute('data-q');
+      document.getElementById('prompt').value = q;
+      // Suggest sensible defaults:
+      document.getElementById('rag').checked = true;
+      localStorage.setItem('rag', 'true');
+      // Leave strict as‑is so reviewers can compare both behaviors
+    });
 
     // --------- Settings (persist) ---------
     const tempEl = document.getElementById('temperature');
