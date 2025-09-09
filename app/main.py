@@ -196,13 +196,27 @@ if USE_LANGCHAIN:
 
         sources: list[dict] = []
         context_text = ""
+        supported = True        # default
+        emit_sources = False    # default: don't show unless strict or grounded
+
         if req.rag and user_last:
             docs, context_text = _collect_docs_and_context(AWS_REGION, user_last, k=req.k or 6)
             sources = _build_sources(docs)
-            if req.strict and not _judge_supported(user_last, context_text):
-                # Tiny lexical backstop in case judge is too harsh/failed
-                if _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
+
+            if req.strict:
+                # Strict: require direct support; if unsupported, short-circuit to "Not in policy."
+                supported = _judge_supported(user_last, context_text)
+                if not supported and _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
                     return {"answer": "Not in policy.", "sources": sources}
+                emit_sources = True   # show sources in strict mode
+            else:
+                # Non-strict: show sources only if the context actually supports the Q
+                supported = bool(context_text) and _judge_supported(user_last, context_text)
+                emit_sources = supported
+
+        from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+        from langchain_aws import ChatBedrockConverse
+        llm = ChatBedrockConverse(model=MODEL_ID, region_name=AWS_REGION)
 
         lc_msgs = []
         if context_text:
@@ -216,7 +230,7 @@ if USE_LANGCHAIN:
         try:
             out = llm.invoke(lc_msgs)
             ans = out.content or ""
-            return {"answer": ans, "sources": sources if req.rag else None}
+            return {"answer": ans, "sources": (sources if emit_sources else None)}
         except Exception as e:
             raise HTTPException(status_code=502, detail=_err_dict(e))
 
@@ -230,18 +244,26 @@ else:
         bedrock = boto3.client("bedrock-runtime", region_name=AWS_REGION)
         sources: list[dict] = []
         context_text = ""
+        supported = True
+        emit_sources = False
+
         if req.rag and user_last:
             docs, context_text = _collect_docs_and_context(AWS_REGION, user_last, k=req.k or 6)
             sources = _build_sources(docs)
-            if req.strict and not _judge_supported(user_last, context_text):
-                if _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
+
+            if req.strict:
+                supported = _judge_supported(user_last, context_text)
+                if not supported and _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
                     return {"answer": "Not in policy.", "sources": sources}
+                emit_sources = True
+            else:
+                supported = bool(context_text) and _judge_supported(user_last, context_text)
+                emit_sources = supported
 
         messages = []
         if context_text:
             sys_text = STRICT_TMPL.format(context=context_text) if req.strict else NONSTRICT_TMPL.format(context=context_text)
             messages.append({"role": "system", "content": [{"text": sys_text}]})
-        # Send only the latest user question to reduce drift
         messages.append({"role": "user", "content": [{"text": user_last or ''}]})
 
         try:
@@ -256,7 +278,7 @@ else:
             )
             parts = resp["output"]["message"]["content"]
             ans = "".join([p.get("text","") for p in parts])
-            return {"answer": ans, "sources": sources if req.rag else None}
+            return {"answer": ans, "sources": (sources if emit_sources else None)}
         except Exception as e:
             raise HTTPException(status_code=502, detail=_err_dict(e))
 
@@ -289,14 +311,32 @@ def chat_stream(req: ChatStreamRequest):
     user_last = next((m.content for m in reversed(req.messages) if m.role == "user"), "")
     sources: list[dict] = []
     context_text = ""
+    supported = True
+    emit_sources = False
 
     if req.rag and user_last:
         docs, context_text = _collect_docs_and_context(AWS_REGION, user_last, k=req.k or 6)
         sources = _build_sources(docs)
 
+        if req.strict:
+            supported = _judge_supported(user_last, context_text)
+            emit_sources = True
+            # Early bail if strict and unsupported
+            if not supported and _keyword_overlap_score(user_last, [s.get("preview","") for s in sources]) < 0.15:
+                def gen_bail():
+                    if emit_sources and sources:
+                        yield _sse({"sources": sources})
+                    yield _sse({"delta": "Not in policy."})
+                    yield _sse({"done": True})
+                headers = {"Cache-Control": "no-cache","X-Accel-Buffering": "no","Connection": "keep-alive"}
+                return StreamingResponse(gen_bail(), media_type="text/event-stream", headers=headers)
+        else:
+            supported = bool(context_text) and _judge_supported(user_last, context_text)
+            emit_sources = supported
+
     def gen() -> Generator[bytes, None, None]:
         try:
-            if sources:
+            if emit_sources and sources:
                 yield _sse({"sources": sources})
 
             # STRICT gate: short-circuit when context doesn't directly support

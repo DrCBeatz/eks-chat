@@ -72,6 +72,7 @@
       <h1>🛡️ EKS Medical Policy Chat</h1>
       <span class="chip">RAG Demo</span>
       <span class="chip">Bedrock · Claude 3 Haiku</span>
+      <span id="ragChip" class="chip" style="display:none">RAG</span>
       <span id="strictChip" class="chip" style="display:none">STRICT</span>
       <span id="kbChip" class="chip" title="Knowledge base status">KB: …</span>
       <span id="apiChip" class="chip"></span>
@@ -176,13 +177,14 @@
       // Suggest sensible defaults:
       document.getElementById('rag').checked = true;
       localStorage.setItem('rag', 'true');
-      // Leave strict as‑is so reviewers can compare both behaviors
+      ragChip.style.display = 'inline-block';
     });
 
     // --------- Settings (persist) ---------
     const tempEl = document.getElementById('temperature');
     const tempValEl = document.getElementById('tempVal');
     const ragEl = document.getElementById('rag');
+    const ragChip = document.getElementById('ragChip');
     const strictEl = document.getElementById('strict');
     const strictChip = document.getElementById('strictChip');
     const sysEl = document.getElementById('systemPrompt');
@@ -192,6 +194,7 @@
       const t = +(localStorage.getItem('temperature') ?? 0.4);
       tempEl.value = t; tempValEl.textContent = t.toFixed(1);
       ragEl.checked = localStorage.getItem('rag') === 'true';
+      ragChip.style.display = ragEl.checked ? 'inline-block' : 'none';
       strictEl.checked = localStorage.getItem('strict') === 'true';
       strictEl.disabled = !ragEl.checked;
       strictChip.style.display = strictEl.checked ? 'inline-block' : 'none';
@@ -204,11 +207,15 @@
     ragEl.onchange = () => {
       localStorage.setItem('rag', ragEl.checked ? 'true' : 'false');
       strictEl.disabled = !ragEl.checked;
+
+      ragChip.style.display = ragEl.checked ? 'inline-block' : 'none';
+
       if (!ragEl.checked && strictEl.checked) {
         strictEl.checked = false;
         localStorage.setItem('strict', 'false');
         strictChip.style.display = 'none';
       }
+      
     };
     strictEl.onchange = () => {
       localStorage.setItem('strict', strictEl.checked ? 'true' : 'false');
@@ -284,7 +291,7 @@
       const items = sources.map(s =>
         `<div>• <span title="${(s.preview||'').replace(/"/g,'&quot;')}"><code>${s.section || 'Document'}</code> — ${s.source}</span></div>`
       ).join('');
-      box.innerHTML = `<div><strong>Sources</strong></div>${items}`;
+      box.innerHTML = `<div><strong>Sources</strong> <span class="chip" style="margin-left:6px;">Grounded to policy</span></div>${items}`;
       bubble.appendChild(box);
     }
 
@@ -297,6 +304,7 @@
       addMessage('user', prompt);
       promptEl.value = '';
       sendBtn.disabled = true;
+      promptEl.disabled = true;
 
       // create assistant bubble with typing indicator
       const aiBubble = addMessage('assistant', '', true);
@@ -326,6 +334,7 @@
         appendText(aiBubble, `\n\n[request failed] ${e}`);
       } finally {
         sendBtn.disabled = false;
+        promptEl.disabled = false;
       }
     }
 
